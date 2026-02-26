@@ -486,8 +486,11 @@ def sync(playlist_filter: str | None = None, config: dict | None = None):
 
     print("\nDownloading missing tracks...")
     success_count = 0
+    total = len(to_download)
+    pad = len(str(total))
+    successful_downloads = []
     for i, track in enumerate(to_download, 1):
-        print(f"  [{i}/{len(to_download)}] ", end="")
+        print(f"  [{i:0{pad}d}/{total}] ", end="")
         if download_track(
             track["video_id"],
             track["title"],
@@ -496,14 +499,14 @@ def sync(playlist_filter: str | None = None, config: dict | None = None):
             music_dir,
         ):
             success_count += 1
+            successful_downloads.append(track)
 
     print(f"\nDownloaded {success_count}/{len(to_download)} tracks")
 
     if success_count > 0:
         print("\nUpdating content.toml...")
-        downloaded_tracks = [t for t in to_download if t["video_id"] not in local_tracks]
         
-        for track in downloaded_tracks:
+        for track in successful_downloads:
             vid = track["video_id"]
             safe_artist = "".join(c for c in track["artist"] if c not in "/\\?%*|\"<>:")
             safe_title = "".join(c for c in track["title"] if c not in "/\\?%*|\"<>:")
