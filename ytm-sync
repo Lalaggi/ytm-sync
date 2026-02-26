@@ -125,17 +125,22 @@ def _setup_from_cookies(cookie_str: str) -> bool:
 
 def setup_auth(download_path: str | None = None) -> bool:
     """Interactive auth setup - paste JSON cookies or headers."""
-    if download_path:
-        config = {"download_path": download_path}
-    else:
-        config = load_config()
-    music_dir = get_music_dir(config)
-
     print("=" * 60)
     print("  YTM-Sync Authentication Setup")
     print("=" * 60)
     print()
-    print(f"  Download path: {music_dir}")
+    
+    if download_path:
+        music_dir = Path(download_path).expanduser()
+    else:
+        print("  Download path (default: ~/Music):")
+        path_input = input("  > ").strip()
+        if path_input:
+            music_dir = Path(path_input).expanduser()
+        else:
+            music_dir = DEFAULT_MUSIC_DIR
+    
+    print(f"  Using download path: {music_dir}")
     print()
     print("  Paste cookies as JSON (from DevTools > Application > Cookies > Export)")
     print("  Or paste raw request headers.")
