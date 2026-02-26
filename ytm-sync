@@ -374,13 +374,13 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
     url = f"https://music.youtube.com/watch?v={video_id}"
 
     try:
-        # Use yt-dlp directly via subprocess for better reliability
         cmd = [
             "yt-dlp",
+            "--write-thumbnail",
             "--embed-metadata",
             "--metadata", f"genre={playlist}",
             "-x", "--audio-format", "m4a", "--audio-quality", "0",
-            "-w",  # overwrite
+            "-w",
             "-o", str(base_path) + ".%(ext)s",
             url
         ]
@@ -393,7 +393,6 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
         
         time.sleep(0.1)
         
-        # Find the downloaded file - look for files starting with the base name
         m4a_path = None
         for ext in [".m4a", ".webm", ".opus"]:
             candidates = list(output_dir.glob(f"{safe_artist} - {safe_title}{ext}*"))
@@ -408,30 +407,64 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
             print(f"    Failed to find downloaded file for {artist} - {title}")
             return False
         
-        # Convert to proper m4a if needed
-        if m4a_path.suffix != ".m4a" or m4a_path.stat().st_size < 10000:
-            final_path = base_path.with_suffix(".m4a")
+        thumb_path = None
+        for ext in [".webp", ".jpg", ".jpeg", ".png"]:
+            candidates = list(output_dir.glob(f"{safe_artist} - {safe_title}{ext}*"))
+            for p in candidates:
+                if p.stat().st_size > 0:
+                    thumb_path = p
+                    break
+            if thumb_path:
+                break
+        
+        if thumb_path:
+            cropped_thumb = thumb_path.with_suffix(".cropped.jpg")
+            crop_result = subprocess.run([
+                "ffmpeg", "-y", "-i", str(thumb_path),
+                "-vf", "crop=min(min(iw,ih),720):min(min(iw,ih),720):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2",
+                "-q:v", "2",
+                str(cropped_thumb)
+            ], capture_output=True, timeout=60)
+            
+            if cropped_thumb.exists():
+                thumb_path.unlink()
+                thumb_path = cropped_thumb
+        
+        final_path = base_path.with_suffix(".m4a")
+        
+        if thumb_path and thumb_path.suffix == ".jpg":
+            result = subprocess.run([
+                "ffmpeg", "-y", "-i", str(m4a_path), "-i", str(thumb_path),
+                "-map", "0:a", "-map", "1:v",
+                "-c:v", "mjpeg",
+                "-q:v", "2",
+                "-c:a", "aac", "-b:a", "320k",
+                "-movflags", "+faststart",
+                "-id3v2_version", "3",
+                "-metadata:s:v", "title=Album cover",
+                "-metadata:s:v", "comment=Cover (front)",
+                str(final_path)
+            ], capture_output=True, timeout=300)
+        else:
             result = subprocess.run([
                 "ffmpeg", "-y", "-i", str(m4a_path),
                 "-c:a", "aac", "-b:a", "320k",
                 "-movflags", "+faststart",
                 str(final_path)
             ], capture_output=True, timeout=300)
-            
-            if final_path.exists() and final_path.stat().st_size > 10000:
-                m4a_path.unlink()
-                m4a_path = final_path
-            else:
-                print(f"    Failed to convert {artist} - {title}")
-                return False
         
-        # Rename to have proper name if needed
+        if final_path.exists() and final_path.stat().st_size > 10000:
+            m4a_path.unlink()
+            m4a_path = final_path
+        else:
+            print(f"    Failed to convert {artist} - {title}")
+            return False
+        
         if m4a_path != base_path.with_suffix(".m4a"):
             final_path = base_path.with_suffix(".m4a")
             m4a_path.rename(final_path)
             m4a_path = final_path
 
-        # Clean up webm/other files
         for f in output_dir.glob(f"{safe_artist} - {safe_title}.*"):
             if f != m4a_path:
                 f.unlink(missing_ok=True)
