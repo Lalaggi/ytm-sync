@@ -368,7 +368,7 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
     try:
         cmd = [
             "yt-dlp",
-            "--write-thumbnail",
+            "--embed-thumbnail",
             "--embed-metadata",
             "--metadata", f"genre={playlist}",
             "-x", "--audio-format", "m4a", "--audio-quality", "0",
@@ -408,61 +408,23 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
             m4a_path.unlink(missing_ok=True)
             return False
         
-        thumb_path = None
-        for ext in [".webp", ".jpg", ".jpeg", ".png"]:
-            candidates = list(output_dir.glob(f"{safe_artist} - {safe_title}{ext}*"))
-            for p in candidates:
-                if p.stat().st_size > 0:
-                    thumb_path = p
-                    break
-            if thumb_path:
-                break
-        
-        if thumb_path:
-            cropped_thumb = thumb_path.with_suffix(".cropped.jpg")
-            crop_result = subprocess.run([
-                "ffmpeg", "-y", "-i", str(thumb_path),
-                "-vf", "crop=min(min(iw,ih),720):min(min(iw,ih),720):(iw-min(iw,ih))/2:(ih-min(iw,ih))/2",
-                "-q:v", "2",
-                str(cropped_thumb)
-            ], capture_output=True, timeout=60)
-            
-            if cropped_thumb.exists() and cropped_thumb.stat().st_size > 0:
-                thumb_path.unlink()
-                thumb_path = cropped_thumb
-            else:
-                thumb_path = None
-        
         final_path = base_path.with_suffix(".m4a")
         
-        if thumb_path and thumb_path.suffix in (".jpg", ".jpeg", ".cropped.jpg"):
-            result = subprocess.run([
-                "ffmpeg", "-y", "-i", str(m4a_path), "-i", str(thumb_path),
-                "-map", "0:a", "-map", "1:v",
-                "-c:v", "mjpeg",
-                "-q:v", "2",
-                "-c:a", "aac", "-b:a", "320k",
-                "-movflags", "+faststart",
-                "-id3v2_version", "3",
-                "-metadata:s:v", "title=Album cover",
-                "-metadata:s:v", "comment=Cover (front)",
-                str(final_path)
-            ], capture_output=True, timeout=300)
-        else:
+        if m4a_path.suffix != ".m4a" or m4a_path.stat().st_size < 10000:
             result = subprocess.run([
                 "ffmpeg", "-y", "-i", str(m4a_path),
                 "-c:a", "aac", "-b:a", "320k",
                 "-movflags", "+faststart",
                 str(final_path)
             ], capture_output=True, timeout=300)
-        
-        if final_path.exists() and final_path.stat().st_size > 10000:
-            if m4a_path != final_path:
-                m4a_path.unlink()
-            m4a_path = final_path
-        else:
-            print(f"    Failed to convert {artist} - {title}")
-            return False
+            
+            if final_path.exists() and final_path.stat().st_size > 10000:
+                if m4a_path != final_path:
+                    m4a_path.unlink()
+                m4a_path = final_path
+            else:
+                print(f"    Failed to convert {artist} - {title}")
+                return False
         
         if m4a_path != base_path.with_suffix(".m4a"):
             final_path = base_path.with_suffix(".m4a")
