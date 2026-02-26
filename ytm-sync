@@ -9,6 +9,7 @@ import toml
 from pathlib import Path
 
 from yt_dlp import YoutubeDL
+import ytmusicapi
 from ytmusicapi import YTMusic
 from ytmusicapi.helpers import get_authorization, initialize_headers, sapisid_from_cookie
 
@@ -284,12 +285,15 @@ def load_content_toml(music_dir: Path) -> dict:
         return toml.load(f)
 
 
-def get_local_tracks(content: dict) -> dict[str, dict]:
-    """Build a dict of video_id -> track info from content.toml."""
+def get_local_tracks(content: dict) -> dict[str, list[dict]]:
+    """Build a dict of video_id -> list of track infos from content.toml."""
     local = {}
     for track in content.get("tracks", []):
         if "youtube_id" in track:
-            local[track["youtube_id"]] = track
+            vid = track["youtube_id"]
+            if vid not in local:
+                local[vid] = []
+            local[vid].append(track)
     return local
 
 
@@ -381,10 +385,10 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
         
         if result.returncode != 0:
             stderr = result.stderr.decode()
-            if "The downloaded file is empty" in stderr:
-                print(f"    Rate limited or empty download for {artist} - {title}, skipping")
+            if "The downloaded file is empty" in stderr or "Did not get any data blocks" in stderr:
+                print(f"    {playlist}: Rate limited or empty download for {artist} - {title}, skipping")
                 return False
-            print(f"    Failed to download {artist} - {title}: {stderr}")
+            print(f"    {playlist}: Failed to download {artist} - {title}: {stderr}")
             return False
         
         time.sleep(0.1)
@@ -435,14 +439,14 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
             if f != m4a_path:
                 f.unlink(missing_ok=True)
         
-        print(f"    Downloaded: {artist} - {title}")
+        print(f"    {playlist}: {artist} - {title}")
         return True
     except Exception as e:
-        print(f"    Failed to download {artist} - {title}: {e}")
+        print(f"    {playlist}: Failed to download {artist} - {title}: {e}")
         return False
 
 
-def sync(playlist_filter: str | None = None, config: dict | None = None):
+def sync(playlist_filter: str | list[str] | None = None, config: dict | None = None):
     """Main sync logic."""
     if config is None:
         config = load_config()
@@ -452,8 +456,15 @@ def sync(playlist_filter: str | None = None, config: dict | None = None):
     print("=" * 40)
     print(f"\n  Download path: {music_dir}")
 
-    if playlist_filter:
-        print(f"\n  Filtering to playlist: {playlist_filter}")
+    if playlist_filter is None or playlist_filter == []:
+        filters = None
+    elif isinstance(playlist_filter, str):
+        filters = [playlist_filter.lower()]
+    else:
+        filters = [f.lower() for f in playlist_filter]
+
+    if filters:
+        print(f"\n  Filtering to playlists: {', '.join(filters)}")
 
     if not validate_auth():
         print("\nAuthentication required. Run 'ytm-sync setup' first.")
@@ -472,38 +483,108 @@ def sync(playlist_filter: str | None = None, config: dict | None = None):
     print(f"  Found {len(ytm_tracks)} tracks in YTM library")
 
     to_download = []
+    to_copy = []
     for track in ytm_tracks:
         video_id = track["video_id"]
+        playlist = track.get("playlist", "Liked Songs")
+        
         if video_id not in local_tracks:
-            if playlist_filter is None or track.get("playlist") == playlist_filter:
+            if filters is None or playlist.lower() in filters:
                 to_download.append(track)
+        else:
+            existing_entries = local_tracks[video_id]
+            track_found = False
+            
+            safe_artist = "".join(c for c in track["artist"] if c not in "/\\?%*|\"<>:()")
+            safe_title = "".join(c for c in track["title"] if c not in "/\\?%*|\"<>:()")
+            
+            for existing in existing_entries:
+                existing_path = Path(existing.get("path", "").replace("~", str(Path.home())))
+                
+                if existing_path.exists():
+                    target_path = music_dir / playlist / existing_path.name
+                    if target_path.exists():
+                        track_found = True
+                        break
+                    else:
+                        if filters is None or playlist.lower() in filters:
+                            to_copy.append((track, existing_path, playlist))
+                            track_found = True
+                            break
+                else:
+                    dir_path = existing_path.parent
+                    if dir_path.exists():
+                        for f in dir_path.glob(f"{safe_artist} - {safe_title}*"):
+                            if f.suffix == ".m4a":
+                                target_path = music_dir / playlist / f.name
+                                if target_path.exists():
+                                    track_found = True
+                                    break
+                                else:
+                                    if filters is None or playlist.lower() in filters:
+                                        to_copy.append((track, f, playlist))
+                                        track_found = True
+                                        break
+                        if track_found:
+                            break
+            
+            if not track_found:
+                if filters is None or playlist.lower() in filters:
+                    to_download.append(track)
 
     print(f"\n  {len(to_download)} tracks need to be downloaded")
+    print(f"  {len(to_copy)} tracks need to be copied")
 
-    if not to_download:
+    if not to_download and not to_copy:
         print("\nLibrary is up to date!")
         return
 
-    print("\nDownloading missing tracks...")
-    success_count = 0
-    total = len(to_download)
-    pad = len(str(total))
     successful_downloads = []
-    for i, track in enumerate(to_download, 1):
-        print(f"  [{i:0{pad}d}/{total}] ", end="")
-        if download_track(
-            track["video_id"],
-            track["title"],
-            track["artist"],
-            track.get("playlist", "Liked Songs"),
-            music_dir,
-        ):
-            success_count += 1
-            successful_downloads.append(track)
+    successful_copies = []
 
-    print(f"\nDownloaded {success_count}/{len(to_download)} tracks")
+    if to_copy:
+        print("\nCopying tracks to new playlists...")
+        success_count = 0
+        total = len(to_copy)
+        pad = len(str(total))
+        for i, (track, existing_path, new_playlist) in enumerate(to_copy, 1):
+            print(f"  [{i:0{pad}d}/{total}] ", end="")
+            try:
+                new_dir = music_dir / new_playlist
+                new_dir.mkdir(parents=True, exist_ok=True)
+                new_path = new_dir / existing_path.name
+                
+                import shutil
+                shutil.copy2(existing_path, new_path)
+                
+                successful_copies.append((track, new_path))
+                success_count += 1
+                print(f"{new_playlist}: {track['artist']} - {track['title']}")
+            except Exception as e:
+                print(f"  Failed to copy {track['artist']} - {track['title']}: {e}")
+        
+        print(f"\nCopied {success_count}/{len(to_copy)} tracks")
 
-    if success_count > 0:
+    if to_download:
+        print("\nDownloading missing tracks...")
+        success_count = 0
+        total = len(to_download)
+        pad = len(str(total))
+        for i, track in enumerate(to_download, 1):
+            print(f"  [{i:0{pad}d}/{total}] ", end="")
+            if download_track(
+                track["video_id"],
+                track["title"],
+                track["artist"],
+                track.get("playlist", "Liked Songs"),
+                music_dir,
+            ):
+                success_count += 1
+                successful_downloads.append(track)
+
+        print(f"\nDownloaded {success_count}/{len(to_download)} tracks")
+
+    if successful_downloads or successful_copies:
         print("\nUpdating content.toml...")
         
         for track in successful_downloads:
@@ -512,7 +593,7 @@ def sync(playlist_filter: str | None = None, config: dict | None = None):
             safe_title = "".join(c for c in track["title"] if c not in "/\\?%*|\"<>:")
             safe_playlist = "".join(c for c in track.get("playlist", "Liked Songs") if c not in "/\\?%*|\"<>:")
             rel_path = str(music_dir / safe_playlist / f"{safe_artist} - {safe_title}.m4a").replace(str(Path.home()), "~")
-            local_tracks[vid] = {
+            new_entry = {
                 "youtube_id": vid,
                 "path": rel_path,
                 "name": track["title"],
@@ -520,11 +601,34 @@ def sync(playlist_filter: str | None = None, config: dict | None = None):
                 "album": track.get("album", ""),
                 "playlist": track.get("playlist", "Liked Songs"),
             }
+            if vid not in local_tracks:
+                local_tracks[vid] = [new_entry]
+            else:
+                local_tracks[vid].append(new_entry)
+        
+        for track, new_path in successful_copies:
+            vid = track["video_id"]
+            rel_path = str(new_path).replace(str(Path.home()), "~")
+            new_entry = {
+                "youtube_id": vid,
+                "path": rel_path,
+                "name": track["title"],
+                "artist": track["artist"],
+                "album": track.get("album", ""),
+                "playlist": track.get("playlist", "Liked Songs"),
+            }
+            if vid not in local_tracks:
+                local_tracks[vid] = [new_entry]
+            else:
+                local_tracks[vid].append(new_entry)
 
         content_file = music_dir / "content.toml"
         with open(content_file, "w") as f:
             f.write("# YTM-Sync Content Library\n\n")
-            f.write(toml.dumps({"tracks": list(local_tracks.values())}))
+            all_tracks = []
+            for track_list in local_tracks.values():
+                all_tracks.extend(track_list)
+            f.write(toml.dumps({"tracks": all_tracks}))
         print(f"  Updated {content_file}")
 
         print("\nGenerating m3u playlist files...")
@@ -542,6 +646,288 @@ def sync(playlist_filter: str | None = None, config: dict | None = None):
                         rel_path = f"{playlist_dir.name}/{track.name}"
                         f.write(f"{rel_path}\n")
                 print(f"  Created {m3u_path.name}")
+
+
+def scan_library(config: dict | None = None):
+    """Scan existing files and build content.toml."""
+    if config is None:
+        config = load_config()
+    music_dir = get_music_dir(config)
+
+    print("YTM-Sync Scan")
+    print("=" * 40)
+    print(f"\n  Scan path: {music_dir}")
+
+    if not validate_auth():
+        print("\nAuthentication required. Run 'ytm-sync setup' first.")
+        sys.exit(1)
+
+    ytm = get_ytmusic_client()
+
+    print("\nFetching YTM library for track IDs...")
+    ytm_tracks = fetch_ytm_library(ytm)
+    
+    ytm_by_name = {}
+    for track in ytm_tracks:
+        safe_artist = "".join(c for c in track["artist"] if c not in "/\\?%*|\"<>:()").lower()
+        safe_title = "".join(c for c in track["title"] if c not in "/\\?%*|\"<>:()").lower()
+        key = f"{safe_artist} - {safe_title}"
+        if key not in ytm_by_name:
+            ytm_by_name[key] = []
+        ytm_by_name[key].append(track)
+
+    tracks = {}
+
+    for playlist_dir in music_dir.iterdir():
+        if not playlist_dir.is_dir():
+            continue
+        if playlist_dir.name.startswith("."):
+            continue
+        
+        for track_file in playlist_dir.glob("*.m4a"):
+            if not track_file.is_file():
+                continue
+            
+            name = track_file.stem
+            if " - " in name:
+                artist, title = name.split(" - ", 1)
+            else:
+                artist = "Unknown"
+                title = name
+            
+            safe_artist = "".join(c for c in artist if c not in "/\\?%*|\"<>:()").lower()
+            safe_title = "".join(c for c in title if c not in "/\\?%*|\"<>:()").lower()
+            key = f"{safe_artist} - {safe_title}"
+            
+            ytm_match = ytm_by_name.get(key)
+            
+            if not ytm_match:
+                continue
+            
+            matched_track = ytm_match[0]
+            youtube_id = matched_track["video_id"]
+            
+            rel_path = str(track_file).replace(str(Path.home()), "~")
+            
+            new_entry = {
+                "youtube_id": youtube_id,
+                "path": rel_path,
+                "name": title,
+                "artist": artist,
+                "album": "",
+                "playlist": playlist_dir.name,
+            }
+            
+            if youtube_id not in tracks:
+                tracks[youtube_id] = []
+            
+            existing_paths = [t.get("path") for t in tracks[youtube_id]]
+            if rel_path not in existing_paths:
+                tracks[youtube_id].append(new_entry)
+
+    count = sum(len(v) for v in tracks.values())
+    print(f"\n  Found {count} tracks")
+
+    if count > 0:
+        content_file = music_dir / "content.toml"
+        all_tracks = []
+        for track_list in tracks.values():
+            all_tracks.extend(track_list)
+        with open(content_file, "w") as f:
+            f.write("# YTM-Sync Content Library\n\n")
+            f.write(toml.dumps({"tracks": all_tracks}))
+        print(f"  Updated {content_file}")
+    else:
+        print("  No tracks found")
+
+
+def fix_playlists(config: dict | None = None):
+    """Fix m3u8 playlist files with correct paths."""
+    if config is None:
+        config = load_config()
+    music_dir = get_music_dir(config)
+
+    print("YTM-Sync Fix Playlists")
+    print("=" * 40)
+    print(f"\n  Music path: {music_dir}")
+
+    content_file = music_dir / "content.toml"
+    if not content_file.exists():
+        print("\n  No content.toml found. Run 'scan' first.")
+        return
+
+    content = toml.load(content_file)
+    tracks = content.get("tracks", [])
+
+    playlists = {}
+    for track in tracks:
+        playlist = track.get("playlist", "Unknown")
+        if playlist not in playlists:
+            playlists[playlist] = []
+        
+        path = track.get("path", "")
+        if path:
+            full_path = Path(path.replace("~", str(Path.home())))
+            if full_path.exists():
+                playlists[playlist].append(full_path)
+
+    print(f"\n  Found {len(playlists)} playlists")
+
+    for playlist, track_files in playlists.items():
+        if not track_files:
+            continue
+        
+        playlist_dir = music_dir / playlist
+        playlist_dir.mkdir(parents=True, exist_ok=True)
+        
+        m3u_path = playlist_dir / f"{playlist}.m3u8"
+        
+        with open(m3u_path, "w") as f:
+            f.write("#EXTM3U\n")
+            for track_file in sorted(track_files):
+                f.write(f"{track_file}\n")
+        
+        print(f"  Updated {m3u_path.name} ({len(track_files)} tracks)")
+
+
+def get_track(query: str, config: dict | None = None):
+    """Interactive search and download a single track."""
+    if config is None:
+        config = load_config()
+    music_dir = get_music_dir(config)
+
+    print("YTM-Sync Get")
+    print("=" * 40)
+
+    if not validate_auth():
+        print("\nAuthentication required. Run 'ytm-sync setup' first.")
+        sys.exit(1)
+
+    ytm = get_ytmusic_client()
+
+    print(f"\n  Searching for: {query}")
+    
+    results = ytmusicapi.YTMusic.search(query, "songs", limit=10)
+    
+    if not results:
+        print("  No results found.")
+        return
+
+    print("\n  Results:")
+    for i, result in enumerate(results, 1):
+        title = result.get("title", "Unknown")
+        artists = ", ".join(a.get("name", "Unknown") for a in result.get("artists", []))
+        album = result.get("album", {}).get("name", "") if result.get("album") else ""
+        print(f"  {i}. {artists} - {title}")
+        if album:
+            print(f"     Album: {album}")
+
+    print("\n  Enter number to download (or 'q' to quit):")
+    choice = input("  > ").strip()
+
+    if choice.lower() == 'q':
+        print("  Cancelled.")
+        return
+
+    try:
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(results):
+            print("  Invalid choice.")
+            return
+    except ValueError:
+        print("  Invalid input.")
+        return
+
+    result = results[idx]
+    video_id = result.get("videoId")
+    title = result.get("title", "Unknown")
+    artists = ", ".join(a.get("name", "Unknown") for a in result.get("artists", []))
+    album = result.get("album", {}).get("name", "") if result.get("album") else ""
+
+    if not video_id:
+        print("  No video ID found.")
+        return
+
+    print(f"\n  Downloading: {artists} - {title}")
+
+    output_dir = music_dir / "__GET__"
+    if album:
+        output_dir = output_dir / album
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base_path = output_dir / f"{artists} - {title}"
+    url = f"https://music.youtube.com/watch?v={video_id}"
+
+    cmd = [
+        "yt-dlp",
+        "--embed-thumbnail",
+        "--embed-metadata",
+        "-x", "--audio-format", "m4a", "--audio-quality", "0",
+        "-o", str(base_path) + ".%(ext)s",
+        url
+    ]
+
+    result_dl = subprocess.run(cmd, capture_output=True, timeout=300)
+
+    if result_dl.returncode != 0:
+        print(f"  Download failed: {result_dl.stderr.decode()}")
+        return
+
+    m4a_path = None
+    safe_artist = "".join(c for c in artists if c not in "/\\?%*|\"<>:()").replace("'", "")
+    safe_title = "".join(c for c in title if c not in "/\\?%*|\"<>:()").replace("'", "")
+    
+    for ext in [".m4a", ".webm", ".opus"]:
+        candidates = list(output_dir.glob(f"{safe_artist} - {safe_title}{ext}*"))
+        for p in candidates:
+            if p.stat().st_size > 0:
+                m4a_path = p
+                break
+        if m4a_path:
+            break
+    
+    if not m4a_path:
+        for ext in [".m4a", ".webm", ".opus"]:
+            candidates = list(output_dir.glob(f"*{ext}*"))
+            for p in candidates:
+                if p.stat().st_size > 10000:
+                    m4a_path = p
+                    break
+            if m4a_path:
+                break
+
+    if not m4a_path:
+        print("  Failed to find downloaded file.")
+        return
+
+    final_path = base_path.with_suffix(".m4a")
+    if m4a_path.suffix != ".m4a":
+        conv_result = subprocess.run([
+            "ffmpeg", "-y", "-i", str(m4a_path),
+            "-c:a", "aac", "-b:a", "320k",
+            "-movflags", "+faststart",
+            str(final_path)
+        ], capture_output=True, timeout=300)
+        
+        if final_path.exists() and final_path.stat().st_size > 10000:
+            m4a_path.unlink()
+            m4a_path = final_path
+        else:
+            print("  Failed to convert file.")
+            return
+
+    if m4a_path != final_path:
+        m4a_path.rename(final_path)
+        m4a_path = final_path
+
+    for f in output_dir.glob(f"{artists} - {title}.*"):
+        if f != m4a_path:
+            f.unlink(missing_ok=True)
+
+    print(f"  Downloaded: {m4a_path}")
+
+    print("\n  Opening with default player...")
+    subprocess.run(["xdg-open", str(m4a_path)])
 
 
 def list_library():
@@ -596,10 +982,17 @@ def main():
         setup_parser = subparsers.add_parser("setup", help="Set up authentication")
         setup_parser.add_argument("-p", "--path", help="Download path (default: ~/Music or config file)")
         sync_parser = subparsers.add_parser("sync", help="Sync library")
-        sync_parser.add_argument("playlist", nargs="?", help="Sync specific playlist only")
+        sync_parser.add_argument("playlist", nargs="*", help="Sync specific playlist(s) only")
         sync_parser.add_argument("-p", "--path", help="Download path (default: ~/Music or config file)")
         subparsers.add_parser("validate", help="Validate authentication")
         subparsers.add_parser("list", help="List playlists and track counts")
+        scan_parser = subparsers.add_parser("scan", help="Scan existing files and build content.toml")
+        scan_parser.add_argument("-o", "--path", help="Scan path (default: ~/Music or config file)")
+        fix_parser = subparsers.add_parser("fix-playlists", help="Fix m3u8 playlist files")
+        fix_parser.add_argument("-o", "--path", help="Music path (default: ~/Music or config file)")
+        get_parser = subparsers.add_parser("get", help="Search and download a single track")
+        get_parser.add_argument("query", nargs="+", help="Search query")
+        get_parser.add_argument("-o", "--path", help="Music path (default: ~/Music or config file)")
 
         args = parser.parse_args()
 
@@ -620,6 +1013,22 @@ def main():
             sys.exit(0 if success else 1)
         elif args.command == "list":
             list_library()
+        elif args.command == "scan":
+            if args.path:
+                scan_library({"download_path": args.path})
+            else:
+                scan_library()
+        elif args.command == "fix-playlists":
+            if args.path:
+                fix_playlists({"download_path": args.path})
+            else:
+                fix_playlists()
+        elif args.command == "get":
+            query = " ".join(args.query)
+            if args.path:
+                get_track(query, {"download_path": args.path})
+            else:
+                get_track(query)
     except KeyboardInterrupt:
         print("\nExiting...")
         sys.exit(130)
