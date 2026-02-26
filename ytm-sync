@@ -158,7 +158,12 @@ def setup_auth(download_path: str | None = None) -> bool:
     if not validate_download_path(music_dir):
         return False
     
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        toml.dump({"download_path": str(music_dir)}, f)
+    
     print(f"  Using download path: {music_dir}")
+    print(f"  Config saved to {CONFIG_FILE}")
     print()
     print("  Paste cookies as JSON (from DevTools > Application > Cookies > Export)")
     print("  Or paste raw request headers.")
