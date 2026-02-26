@@ -418,13 +418,15 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
                 str(cropped_thumb)
             ], capture_output=True, timeout=60)
             
-            if cropped_thumb.exists():
+            if cropped_thumb.exists() and cropped_thumb.stat().st_size > 0:
                 thumb_path.unlink()
                 thumb_path = cropped_thumb
+            else:
+                thumb_path = None
         
         final_path = base_path.with_suffix(".m4a")
         
-        if thumb_path and thumb_path.suffix == ".jpg":
+        if thumb_path and thumb_path.suffix in (".jpg", ".jpeg", ".cropped.jpg"):
             result = subprocess.run([
                 "ffmpeg", "-y", "-i", str(m4a_path), "-i", str(thumb_path),
                 "-map", "0:a", "-map", "1:v",
@@ -555,12 +557,16 @@ def sync(playlist_filter: str | None = None, config: dict | None = None):
         for playlist_dir in music_dir.iterdir():
             if not playlist_dir.is_dir():
                 continue
+            if playlist_dir.name.startswith("."):
+                continue
             m3u_path = playlist_dir / f"{playlist_dir.name}.m3u8"
             tracks = sorted(playlist_dir.glob("*.m4a"))
             if tracks:
                 with open(m3u_path, "w") as f:
+                    f.write("#EXTM3U\n")
                     for track in tracks:
-                        f.write(f"{track.name}\n")
+                        rel_path = f"{playlist_dir.name}/{track.name}"
+                        f.write(f"{rel_path}\n")
                 print(f"  Created {m3u_path.name}")
 
 
