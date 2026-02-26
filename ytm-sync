@@ -297,19 +297,6 @@ def fetch_ytm_library(ytm: YTMusic) -> list[dict]:
     """Fetch all tracks from YTM library."""
     tracks = []
 
-    print("  Fetching liked songs...")
-    liked = ytm.get_liked_songs(limit=10000)
-    for item in liked.get("tracks", []):
-        video_id = item.get("videoId")
-        if video_id:
-            tracks.append({
-                "video_id": video_id,
-                "title": item.get("title", "Unknown"),
-                "artist": ", ".join(a.get("name", "Unknown") for a in item.get("artists", [])),
-                "album": (item.get("album") or {}).get("name", ""),
-                "playlist": "Liked Songs",
-            })
-
     print("  Fetching library playlists...")
     playlists = ytm.get_library_playlists(limit=1000)
     for playlist in playlists:
@@ -318,6 +305,11 @@ def fetch_ytm_library(ytm: YTMusic) -> list[dict]:
             continue
 
         playlist_title = playlist.get("title", "Unknown Playlist")
+
+        if playlist_title == "Liked Songs":
+            print(f"    Skipping playlist: {playlist_title}")
+            continue
+
         print(f"    Fetching playlist: {playlist_title}")
 
         try:
