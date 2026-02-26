@@ -454,7 +454,8 @@ def download_track(video_id: str, title: str, artist: str, playlist: str, music_
             ], capture_output=True, timeout=300)
         
         if final_path.exists() and final_path.stat().st_size > 10000:
-            m4a_path.unlink()
+            if m4a_path != final_path:
+                m4a_path.unlink()
             m4a_path = final_path
         else:
             print(f"    Failed to convert {artist} - {title}")
