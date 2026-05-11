@@ -455,11 +455,70 @@ def download_track(video_id: str, title: str, artist: str, album: str,
                 f.unlink(missing_ok=True)
 
         print(f"    {playlist}: {artist} - {title}")
+        if fix_audio_mime_type(final_path):
+            print(f"    Converted video/ogg to audio/ogg: {final_path.name}")
         return final_path
 
     except Exception as e:
         print(f"    {playlist}: Exception — {artist} - {title}: {e}")
         return None
+
+
+def fix_audio_mime_type(filepath: Path) -> bool:
+    """Convert video/ogg to audio/ogg if needed. Returns True if converted."""
+    try:
+        result = subprocess.run(
+            ["file", "--mime-type", "-b", str(filepath)],
+            capture_output=True, text=True, timeout=10,
+        )
+        mime_type = result.stdout.strip()
+        if mime_type != "video/ogg":
+            return False
+
+        # Extract cover art (first frame) as JPEG
+        cover_path = filepath.with_suffix(".jpg")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(filepath), "-vframes", "1", "-update", "1", str(cover_path)],
+            capture_output=True, timeout=30,
+        )
+        if not cover_path.exists() or cover_path.stat().st_size < 1000:
+            cover_path.unlink(missing_ok=True)
+
+        # Convert to audio-only opus
+        fixed_path = filepath.with_stem(filepath.stem + "_fixed")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(filepath), "-vn", "-c:a", "libopus", "-b:a", "256k", str(fixed_path)],
+            capture_output=True, timeout=300,
+        )
+
+        if fixed_path.exists() and fixed_path.stat().st_size > 1000:
+            if cover_path.exists():
+                try:
+                    import base64
+                    from mutagen.oggopus import OggOpus
+                    from mutagen.flac import Picture
+                    with open(cover_path, "rb") as f:
+                        image_data = f.read()
+                    audio = OggOpus(str(fixed_path))
+                    picture = Picture()
+                    picture.data = image_data
+                    picture.type = 3
+                    picture.mime = "image/jpeg"
+                    picture.desc = "front cover"
+                    audio["metadata_block_picture"] = [base64.b64encode(picture.write()).decode("ascii")]
+                    audio.save()
+                except Exception:
+                    pass
+
+            if filepath.exists():
+                filepath.unlink()
+            fixed_path.rename(filepath)
+            return True
+
+        cover_path.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"    fix_audio_mime_type exception: {e}")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1095,9 @@ def get_track(query: str, config: dict | None = None) -> None:
     for f in output_dir.glob("_tmp_get_*"):
         if f.is_file() and f != final_path:
             f.unlink(missing_ok=True)
+
+    if fix_audio_mime_type(final_path):
+        print("  Converted video/ogg to audio/ogg")
 
     print(f"  Saved: {final_path}")
 
