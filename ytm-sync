@@ -49,7 +49,7 @@ def make_track_entry(track: dict, music_dir: Path) -> dict:
     safe_artist = sanitize(track["artist"])
     safe_title  = sanitize(track["title"])
     safe_album  = sanitize(track.get("album") or "Unknown Album")
-    full = music_dir / safe_artist / safe_album / f"{safe_artist} - {safe_title}.m4a"
+    full = music_dir / safe_artist / safe_album / f"{safe_artist} - {safe_title}.ogg"
     return {
         "youtube_id": track["video_id"],
         "path":       rel_path(full),
@@ -381,20 +381,20 @@ def download_track(video_id: str, title: str, artist: str, album: str,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     filename_base = f"{safe_artist} - {safe_title}"
-    final_path    = output_dir / f"{filename_base}.m4a"
-    # Use a stable temp name derived from video_id so yt-dlp can't mangle it
+    final_path    = output_dir / f"{filename_base}.ogg"
     tmp_base      = output_dir / f"_tmp_{video_id}"
     url           = f"https://music.youtube.com/watch?v={video_id}"
 
     cmd = [
         "yt-dlp",
         "--embed-thumbnail", "--embed-metadata",
-        "--parse-metadata", f":{title}:%(title)s",   # don't let YT title override our rename
+        "--parse-metadata", f":{title}:%(title)s",
         "--metadata", f"title={title}",
         "--metadata", f"artist={artist}",
         "--metadata", f"album={album}",
         "--metadata", f"genre={playlist}",
-        "-x", "--audio-format", "m4a", "--audio-quality", "0",
+        "--metadata", f"comment=https://music.youtube.com/watch?v={video_id}",
+        "-x", "--audio-format", "opus", "--audio-quality", "0",
         "-w",
         "-o", f"{tmp_base}.%(ext)s",
         url,
@@ -413,42 +413,39 @@ def download_track(video_id: str, title: str, artist: str, album: str,
 
         time.sleep(0.1)
 
-        # Find the downloaded file — tmp_base name is deterministic so this should always match
-        m4a_path = None
-        for ext in (".m4a", ".webm", ".opus"):
+        ogg_path = None
+        for ext in (".opus", ".ogg", ".webm"):
             for p in output_dir.glob(f"_tmp_{video_id}{ext}*"):
                 if p.stat().st_size > 0:
-                    m4a_path = p
+                    ogg_path = p
                     break
-            if m4a_path:
+            if ogg_path:
                 break
 
-        if not m4a_path:
-            # Fallback: any recently-modified audio file in the dir
+        if not ogg_path:
             now = time.time()
-            for ext in (".m4a", ".webm", ".opus"):
+            for ext in (".opus", ".ogg", ".webm"):
                 for p in output_dir.glob(f"*{ext}"):
                     if p.stat().st_size > 10_000 and (now - p.stat().st_mtime) < 120:
-                        m4a_path = p
+                        ogg_path = p
                         break
-                if m4a_path:
+                if ogg_path:
                     break
 
-        if not m4a_path:
+        if not ogg_path:
             print(f"    {playlist}: Could not locate downloaded file — {artist} - {title}")
             return None
 
-        if m4a_path.stat().st_size < 1_000:
+        if ogg_path.stat().st_size < 1_000:
             print(f"    {playlist}: File too small, skipping — {artist} - {title}")
-            m4a_path.unlink(missing_ok=True)
+            ogg_path.unlink(missing_ok=True)
             return None
 
-        if m4a_path != final_path:
-            print(f"    Renaming: {m4a_path.name} -> {final_path.name}")
+        if ogg_path != final_path:
+            print(f"    Renaming: {ogg_path.name} -> {final_path.name}")
             final_path.unlink(missing_ok=True)
-            m4a_path.rename(final_path)
+            ogg_path.rename(final_path)
 
-        # Clean up any leftover temp files from this download
         for f in output_dir.glob(f"_tmp_{video_id}*"):
             if f.is_file() and f != final_path:
                 f.unlink(missing_ok=True)
@@ -479,7 +476,37 @@ def crop_cover_art(filepath: Path) -> bool:
     ext = filepath.suffix.lower()
 
     try:
-        if ext == ".m4a":
+        if ext in (".ogg", ".opus"):
+            import base64
+            import mutagen
+            from mutagen.flac import Picture
+
+            audio = mutagen.File(str(filepath))
+            if audio is None:
+                return False
+
+            pictures = audio.get("metadata_block_picture", [])
+            new_pics, changed = [], False
+            for b64 in pictures:
+                pic = Picture(base64.b64decode(b64))
+                if pic.type == 3:
+                    img  = Image.open(io.BytesIO(pic.data))
+                    w, h = img.size
+                    if w != h:
+                        size = min(w, h)
+                        left = (w - size) // 2
+                        top  = (h - size) // 2
+                        out  = io.BytesIO()
+                        img.crop((left, top, left + size, top + size)).save(out, format="PNG")
+                        pic.data = out.getvalue()
+                        changed  = True
+                new_pics.append(base64.b64encode(pic.write()).decode("ascii"))
+            if changed:
+                audio["metadata_block_picture"] = new_pics
+                audio.save()
+            return changed
+
+        elif ext == ".m4a":
             from mutagen.mp4 import MP4, MP4Cover
             audio  = MP4(str(filepath))
             covers = audio.tags.get("covr", [])
@@ -488,16 +515,16 @@ def crop_cover_art(filepath: Path) -> bool:
 
             new_covers, changed = [], False
             for cover in covers:
-                img    = Image.open(io.BytesIO(bytes(cover)))
-                w, h   = img.size
+                img  = Image.open(io.BytesIO(bytes(cover)))
+                w, h = img.size
                 if w == h:
                     new_covers.append(cover)
                     continue
-                size   = min(w, h)
-                left   = (w - size) // 2
-                top    = (h - size) // 2
-                out    = io.BytesIO()
-                fmt    = "PNG" if cover.imageformat == MP4Cover.FORMAT_PNG else "JPEG"
+                size = min(w, h)
+                left = (w - size) // 2
+                top  = (h - size) // 2
+                out  = io.BytesIO()
+                fmt  = "PNG" if cover.imageformat == MP4Cover.FORMAT_PNG else "JPEG"
                 img.crop((left, top, left + size, top + size)).save(out, format=fmt)
                 new_fmt = MP4Cover.FORMAT_PNG if fmt == "PNG" else MP4Cover.FORMAT_JPEG
                 new_covers.append(MP4Cover(out.getvalue(), imageformat=new_fmt))
@@ -510,7 +537,6 @@ def crop_cover_art(filepath: Path) -> bool:
 
         elif ext == ".flac":
             from mutagen.flac import FLAC
-            import io
             audio, changed = FLAC(str(filepath)), False
             for pic in audio.pictures:
                 if pic.type != 3:
@@ -519,13 +545,13 @@ def crop_cover_art(filepath: Path) -> bool:
                 w, h = img.size
                 if w == h:
                     continue
-                size   = min(w, h)
-                left   = (w - size) // 2
-                top    = (h - size) // 2
-                out    = io.BytesIO()
+                size = min(w, h)
+                left = (w - size) // 2
+                top  = (h - size) // 2
+                out  = io.BytesIO()
                 img.crop((left, top, left + size, top + size)).save(out, format="JPEG")
-                pic.data  = out.getvalue()
-                changed   = True
+                pic.data = out.getvalue()
+                changed  = True
             if changed:
                 audio.save()
             return changed
@@ -550,7 +576,6 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
     print("=" * 40)
     print(f"\n  Download path: {music_dir}")
 
-    # Normalise playlist filter
     if not playlist_filter:
         filters = None
     elif isinstance(playlist_filter, str):
@@ -573,7 +598,7 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
     ytm_tracks = fetch_ytm_library(get_ytmusic_client())
     print(f"  {len(ytm_tracks)} tracks in YTM library")
 
-    to_download:    list[dict] = []
+    to_download:     list[dict] = []
     to_add_playlist: list[dict] = []
 
     for track in ytm_tracks:
@@ -602,12 +627,10 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
         print("\nLibrary is up to date!")
         return
 
-    # Add existing tracks to new playlists
     for track in to_add_playlist:
         vid = track["video_id"]
         local_tracks.setdefault(vid, []).append(make_track_entry(track, music_dir))
 
-    # Download missing tracks
     downloaded_paths: list[Path] = []
     if to_download:
         print("\nDownloading missing tracks...")
@@ -673,16 +696,20 @@ def scan_library(config: dict | None = None) -> None:
                 ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(filepath)],
                 capture_output=True, text=True, timeout=10,
             )
-            comment = json.loads(result.stdout).get("format", {}).get("comment", "")
-            if "youtube.com/watch" in comment:
-                return comment.split("v=")[-1].split("&")[0]
-            if "youtu.be/" in comment:
-                return comment.split("youtu.be/")[-1].split("?")[0]
+            fmt = json.loads(result.stdout).get("format", {})
+            comment = fmt.get("comment", "")
+            purl = fmt.get("purl", "")
+
+            url = purl or comment
+
+            if "youtube.com/watch" in url:
+                return url.split("v=")[-1].split("&")[0]
+            if "youtu.be/" in url:
+                return url.split("youtu.be/")[-1].split("?")[0]
         except Exception:
             pass
         return None
 
-    # Seed from existing content.toml (keep valid entries)
     tracks: dict[str, list[dict]] = {}
     for entry in load_content_toml(music_dir).get("tracks", []):
         vid  = entry.get("youtube_id")
@@ -691,7 +718,6 @@ def scan_library(config: dict | None = None) -> None:
             if path not in [e.get("path") for e in tracks.get(vid, [])]:
                 tracks.setdefault(vid, []).append(entry)
 
-    # Build a flat set of already-tracked paths for quick lookup
     known_paths = {e.get("path") for entries in tracks.values() for e in entries}
 
     for artist_dir in sorted(music_dir.iterdir()):
@@ -700,7 +726,7 @@ def scan_library(config: dict | None = None) -> None:
         for album_dir in sorted(artist_dir.iterdir()):
             if not album_dir.is_dir() or album_dir.name.startswith("."):
                 continue
-            for track_file in sorted(album_dir.glob("*.m4a")):
+            for track_file in sorted(album_dir.glob("*.ogg")):
                 rp = rel_path(track_file)
                 if rp in known_paths:
                     continue
@@ -771,6 +797,53 @@ def fix_covers(config: dict | None = None) -> None:
             print(f"    Error: {fp.name}: {e}")
 
     print(f"\n  Cropped: {cropped}  Skipped: {skipped}  Errors: {errors}")
+
+
+def fix_metadata(config: dict | None = None) -> None:
+    """Rewrite embedded tags from content.toml."""
+    if config is None:
+        config = load_config()
+    music_dir = get_music_dir(config)
+
+    print("YTM-Sync Fix Metadata")
+    print("=" * 40)
+    print(f"\n  Music path: {music_dir}")
+
+    tracks = load_content_toml(music_dir).get("tracks", [])
+    print(f"  Processing {len(tracks)} tracks...")
+
+    updated = skipped = errors = 0
+
+    for track in tracks:
+        path = track.get("path", "")
+        if not path:
+            continue
+        fp = expand_path(path)
+        if not fp.exists():
+            skipped += 1
+            continue
+
+        youtube_id = track.get("youtube_id", "")
+        if not youtube_id:
+            skipped += 1
+            continue
+
+        url = f"https://music.youtube.com/watch?v={youtube_id}"
+
+        try:
+            from mutagen.oggopus import OggOpus
+            from mutagen.oggvorbis import OggVorbis
+            audio = OggOpus(str(fp)) if fp.suffix.lower() == ".opus" else OggVorbis(str(fp))
+            audio["comment"] = url
+            audio["purl"] = url
+            audio.save()
+            updated += 1
+            print(f"    Updated: {fp.name}")
+        except Exception as e:
+            errors += 1
+            print(f"    Error: {fp.name}: {e}")
+
+    print(f"\n  Updated: {updated}  Skipped: {skipped}  Errors: {errors}")
 
 
 def fix_playlists(config: dict | None = None) -> None:
@@ -891,7 +964,7 @@ def get_track(query: str, config: dict | None = None) -> None:
     safe_artists = sanitize(artists)
     safe_album   = sanitize(album or "Unknown Album")
     safe_title   = sanitize(title)
-    output_dir   = music_dir / "__GET__" / safe_artists / safe_album
+    output_dir   = music_dir / safe_artists / safe_album
     output_dir.mkdir(parents=True, exist_ok=True)
 
     filename_base = f"{safe_artists} - {safe_title}"
@@ -901,7 +974,7 @@ def get_track(query: str, config: dict | None = None) -> None:
     print(f"\n  Downloading: {artists} - {title}")
     cmd = [
         "yt-dlp", "--embed-thumbnail", "--embed-metadata",
-        "-x", "--audio-format", "m4a", "--audio-quality", "0",
+        "-x", "--audio-format", "opus", "--audio-quality", "0",
         "-o", f"{base_path}.%(ext)s",
         url,
     ]
@@ -910,49 +983,56 @@ def get_track(query: str, config: dict | None = None) -> None:
         print(f"  Download failed: {result.stderr.decode().strip()}")
         return
 
-    m4a_path = None
-    for ext in (".m4a", ".webm", ".opus"):
+    ogg_path = None
+    for ext in (".opus", ".ogg", ".webm"):
         for p in output_dir.glob(f"{filename_base}{ext}*"):
             if p.stat().st_size > 0:
-                m4a_path = p
+                ogg_path = p
                 break
-        if m4a_path:
+        if ogg_path:
             break
-    if not m4a_path:
-        for ext in (".m4a", ".webm", ".opus"):
+    if not ogg_path:
+        for ext in (".opus", ".ogg", ".webm"):
             for p in output_dir.glob(f"*{ext}*"):
                 if p.stat().st_size > 10_000:
-                    m4a_path = p
+                    ogg_path = p
                     break
-            if m4a_path:
+            if ogg_path:
                 break
 
-    if not m4a_path:
+    if not ogg_path:
         print("  Failed to find downloaded file.")
         return
 
-    final_path = base_path.with_suffix(".m4a")
-    if m4a_path.suffix != ".m4a":
+    final_path = base_path.with_suffix(".ogg")
+    if ogg_path.suffix != ".ogg":
         r2 = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(m4a_path), "-c:a", "aac", "-b:a", "320k",
-             "-movflags", "+faststart", str(final_path)],
+            ["ffmpeg", "-y", "-i", str(ogg_path), "-c:a", "libopus", "-b:a", "256k",
+             str(final_path)],
             capture_output=True, timeout=300,
         )
         if final_path.exists() and final_path.stat().st_size > 10_000:
-            m4a_path.unlink()
-            m4a_path = final_path
+            ogg_path.unlink()
+            ogg_path = final_path
         else:
             print("  Failed to convert file.")
             return
 
-    if m4a_path != final_path:
-        m4a_path.rename(final_path)
+    if ogg_path != final_path:
+        ogg_path.rename(final_path)
 
     for f in output_dir.glob(f"{filename_base}.*"):
         if f != final_path:
             f.unlink(missing_ok=True)
 
     print(f"  Saved: {final_path}")
+
+    print("  Cropping cover art...")
+    try:
+        crop_cover_art(final_path)
+    except Exception:
+        pass
+
     subprocess.run(["xdg-open", str(final_path)])
 
 
@@ -1023,17 +1103,17 @@ def main() -> None:
         config = _config_from_args(args)
 
         match args.command:
-            case "setup":        setup_auth(args.path); sys.exit(0)
+            case "setup":         setup_auth(args.path); sys.exit(0)
             case "validate":
                 print(f"  Download path: {get_music_dir(config or load_config())}")
                 sys.exit(0 if validate_auth() else 1)
-            case "list":         list_library()
-            case "sync":         sync(args.playlist or None, config)
-            case "scan":         scan_library(config)
+            case "list":          list_library()
+            case "sync":          sync(args.playlist or None, config)
+            case "scan":          scan_library(config)
             case "fix-playlists": fix_playlists(config)
-            case "fix-covers":   fix_covers(config)
-            case "fix-metadata": fix_metadata(config)
-            case "get":          get_track(" ".join(args.query), config)
+            case "fix-covers":    fix_covers(config)
+            case "fix-metadata":  fix_metadata(config)
+            case "get":           get_track(" ".join(args.query), config)
 
     except KeyboardInterrupt:
         print("\nExiting...")

@@ -20,8 +20,6 @@ try:
     from mutagen.mp3 import MP3
     from mutagen.id3 import ID3, APIC, ID3NoHeaderError
     from mutagen.flac import FLAC, Picture
-    from mutagen.oggvorbis import OggVorbis
-    from mutagen.oggopus import OggOpus
     from mutagen.mp4 import MP4, MP4Cover
     from mutagen.aiff import AIFF
     import mutagen
@@ -96,17 +94,16 @@ def fix_flac(path: Path, dry_run: bool) -> bool:
     return changed
 
 
-def fix_ogg_vorbis(path: Path, dry_run: bool) -> bool:
-    """OGG stores cover as base64-encoded FLAC Picture blocks."""
-    import base64
-    audio = OggVorbis(path)
-    return _fix_ogg_picture(audio, path, dry_run, 'OGG')
-
-
-def fix_ogg_opus(path: Path, dry_run: bool) -> bool:
-    import base64
-    audio = OggOpus(path)
-    return _fix_ogg_picture(audio, path, dry_run, 'OPUS')
+def fix_ogg_any(path: Path, dry_run: bool) -> bool:
+    """
+    Use mutagen's generic File() to auto-detect the actual OGG stream type
+    (Vorbis, Opus, Speex, etc.) rather than guessing from extension.
+    YTM downloads are often Opus streams with a .ogg extension.
+    """
+    audio = mutagen.File(path)
+    if audio is None:
+        raise ValueError("mutagen could not identify file")
+    return _fix_ogg_picture(audio, path, dry_run, type(audio).__name__)
 
 
 def _fix_ogg_picture(audio, path: Path, dry_run: bool, fmt: str) -> bool:
@@ -123,8 +120,10 @@ def _fix_ogg_picture(audio, path: Path, dry_run: bool, fmt: str) -> bool:
                 if not dry_run:
                     pic.data = new_data
                     new_pictures.append(base64.b64encode(pic.write()).decode('ascii'))
-                    changed = True
-                    continue
+                else:
+                    new_pictures.append(b64)
+                changed = True
+                continue
         new_pictures.append(b64)
 
     if changed and not dry_run:
@@ -176,8 +175,8 @@ def fix_aiff(path: Path, dry_run: bool) -> bool:
 HANDLERS = {
     '.mp3':  fix_mp3,
     '.flac': fix_flac,
-    '.ogg':  fix_ogg_vorbis,
-    '.opus': fix_ogg_opus,
+    '.ogg':  fix_ogg_any,
+    '.opus': fix_ogg_any,
     '.m4a':  fix_m4a,
     '.aac':  fix_m4a,
     '.aiff': fix_aiff,
