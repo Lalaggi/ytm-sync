@@ -394,6 +394,7 @@ def download_track(video_id: str, title: str, artist: str, album: str,
         "--metadata", f"album={album}",
         "--metadata", f"genre={playlist}",
         "--metadata", f"comment=https://music.youtube.com/watch?v={video_id}",
+        "--metadata", f"purl=https://music.youtube.com/watch?v={video_id}",
         "-x", "--audio-format", "opus", "--audio-quality", "0",
         "-w",
         "-o", f"{tmp_base}.%(ext)s",
@@ -972,10 +973,18 @@ def get_track(query: str, config: dict | None = None) -> None:
     url           = f"https://music.youtube.com/watch?v={video_id}"
 
     print(f"\n  Downloading: {artists} - {title}")
+    tmp_base = output_dir / f"_tmp_get_{video_id}"
     cmd = [
         "yt-dlp", "--embed-thumbnail", "--embed-metadata",
+        "--parse-metadata", f":{title}:%(title)s",
+        "--metadata", f"title={title}",
+        "--metadata", f"artist={artists}",
+        "--metadata", f"album={album}",
+        "--metadata", f"comment=https://music.youtube.com/watch?v={video_id}",
+        "--metadata", f"purl=https://music.youtube.com/watch?v={video_id}",
         "-x", "--audio-format", "opus", "--audio-quality", "0",
-        "-o", f"{base_path}.%(ext)s",
+        "-w",
+        "-o", f"{tmp_base}.%(ext)s",
         url,
     ]
     result = subprocess.run(cmd, capture_output=True, timeout=300)
@@ -985,7 +994,7 @@ def get_track(query: str, config: dict | None = None) -> None:
 
     ogg_path = None
     for ext in (".opus", ".ogg", ".webm"):
-        for p in output_dir.glob(f"{filename_base}{ext}*"):
+        for p in output_dir.glob(f"_tmp_get_{video_id}{ext}*"):
             if p.stat().st_size > 0:
                 ogg_path = p
                 break
@@ -993,7 +1002,7 @@ def get_track(query: str, config: dict | None = None) -> None:
             break
     if not ogg_path:
         for ext in (".opus", ".ogg", ".webm"):
-            for p in output_dir.glob(f"*{ext}*"):
+            for p in output_dir.glob(f"_tmp_get_*{ext}*"):
                 if p.stat().st_size > 10_000:
                     ogg_path = p
                     break
@@ -1023,6 +1032,9 @@ def get_track(query: str, config: dict | None = None) -> None:
 
     for f in output_dir.glob(f"{filename_base}.*"):
         if f != final_path:
+            f.unlink(missing_ok=True)
+    for f in output_dir.glob("_tmp_get_*"):
+        if f.is_file() and f != final_path:
             f.unlink(missing_ok=True)
 
     print(f"  Saved: {final_path}")
