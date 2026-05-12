@@ -997,117 +997,157 @@ def get_track(query: str, config: dict | None = None) -> None:
             line += f"  [{album}]"
         print(line)
 
-    print("\n  Enter number to download (or q to quit): ", end="")
+    print("\n  Enter number(s) to download (e.g. 1,2,3 or 1-3, or q to quit): ", end="")
     choice = input().strip()
     if choice.lower() == "q":
         print("  Cancelled.")
         return
 
-    try:
-        idx = int(choice) - 1
-        if not 0 <= idx < len(results):
-            raise ValueError
-    except ValueError:
-        print("  Invalid choice.")
+    indices = []
+    for part in re.split(r'[,\s]+', choice):
+        if not part:
+            continue
+        if '-' in part:
+            try:
+                a, b = part.split('-', 1)
+                lo, hi = int(a), int(b)
+                if lo > hi:
+                    lo, hi = hi, lo
+                if not (1 <= lo <= len(results) and 1 <= hi <= len(results)):
+                    print(f"  Invalid range: {part}")
+                    return
+                indices.extend(range(lo, hi + 1))
+            except ValueError:
+                print(f"  Invalid choice: {part}")
+                return
+        else:
+            try:
+                n = int(part)
+                if not 1 <= n <= len(results):
+                    print(f"  Invalid choice: {n}")
+                    return
+                indices.append(n)
+            except ValueError:
+                print(f"  Invalid choice: {part}")
+                return
+
+    if not indices:
+        print("  No valid selections.")
         return
 
-    r        = results[idx]
-    video_id = r.get("videoId")
-    if not video_id:
-        print("  No video ID found.")
-        return
+    seen = set()
+    ordered = []
+    for n in reversed(indices):
+        if n not in seen:
+            seen.add(n)
+            ordered.append(n)
+    ordered.reverse()
+    last_sel = ordered[-1]
 
-    title   = r.get("title", "Unknown")
-    artists = ", ".join(a.get("name", "Unknown") for a in r.get("artists", []))
-    album   = (r.get("album") or {}).get("name", "")
+    last_path = None
+    for sel in sorted(set(indices)):
+        idx = sel - 1
+        r        = results[idx]
+        video_id = r.get("videoId")
+        if not video_id:
+            print(f"\n  [{sel}] No video ID found.")
+            continue
 
-    safe_artists = sanitize(artists)
-    safe_album   = sanitize(album or "Unknown Album")
-    safe_title   = sanitize(title)
-    output_dir   = music_dir / safe_artists / safe_album
-    output_dir.mkdir(parents=True, exist_ok=True)
+        title   = r.get("title", "Unknown")
+        artists = ", ".join(a.get("name", "Unknown") for a in r.get("artists", []))
+        album   = (r.get("album") or {}).get("name", "")
 
-    filename_base = f"{safe_artists} - {safe_title}"
-    base_path     = output_dir / filename_base
-    url           = f"https://music.youtube.com/watch?v={video_id}"
+        safe_artists = sanitize(artists)
+        safe_album   = sanitize(album or "Unknown Album")
+        safe_title   = sanitize(title)
+        output_dir   = music_dir / safe_artists / safe_album
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n  Downloading: {artists} - {title}")
-    tmp_base = output_dir / f"_tmp_get_{video_id}"
-    cmd = [
-        "yt-dlp", "--embed-thumbnail", "--embed-metadata",
-        "--parse-metadata", f":{title}:%(title)s",
-        "--metadata", f"title={title}",
-        "--metadata", f"artist={artists}",
-        "--metadata", f"album={album}",
-        "--metadata", f"comment=https://music.youtube.com/watch?v={video_id}",
-        "--metadata", f"purl=https://music.youtube.com/watch?v={video_id}",
-        "-x", "--audio-format", "opus", "--audio-quality", "0",
-        "-w",
-        "-o", f"{tmp_base}.%(ext)s",
-        url,
-    ]
-    result = subprocess.run(cmd, capture_output=True, timeout=300)
-    if result.returncode != 0:
-        print(f"  Download failed: {result.stderr.decode().strip()}")
-        return
+        filename_base = f"{safe_artists} - {safe_title}"
+        base_path     = output_dir / filename_base
+        url           = f"https://music.youtube.com/watch?v={video_id}"
 
-    ogg_path = None
-    for ext in (".opus", ".ogg", ".webm"):
-        for p in output_dir.glob(f"_tmp_get_{video_id}{ext}*"):
-            if p.stat().st_size > 0:
-                ogg_path = p
-                break
-        if ogg_path:
-            break
-    if not ogg_path:
+        print(f"\n  [{sel}] Downloading: {artists} - {title}")
+        tmp_base = output_dir / f"_tmp_get_{video_id}"
+        cmd = [
+            "yt-dlp", "--embed-thumbnail", "--embed-metadata",
+            "--parse-metadata", f":{title}:%(title)s",
+            "--metadata", f"title={title}",
+            "--metadata", f"artist={artists}",
+            "--metadata", f"album={album}",
+            "--metadata", f"comment=https://music.youtube.com/watch?v={video_id}",
+            "--metadata", f"purl=https://music.youtube.com/watch?v={video_id}",
+            "-x", "--audio-format", "opus", "--audio-quality", "0",
+            "-w",
+            "-o", f"{tmp_base}.%(ext)s",
+            url,
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode != 0:
+            print(f"  [{sel}] Download failed: {result.stderr.decode().strip()}")
+            continue
+
+        ogg_path = None
         for ext in (".opus", ".ogg", ".webm"):
-            for p in output_dir.glob(f"_tmp_get_*{ext}*"):
-                if p.stat().st_size > 10_000:
+            for p in output_dir.glob(f"_tmp_get_{video_id}{ext}*"):
+                if p.stat().st_size > 0:
                     ogg_path = p
                     break
             if ogg_path:
                 break
+        if not ogg_path:
+            for ext in (".opus", ".ogg", ".webm"):
+                for p in output_dir.glob(f"_tmp_get_*{ext}*"):
+                    if p.stat().st_size > 10_000:
+                        ogg_path = p
+                        break
+                if ogg_path:
+                    break
 
-    if not ogg_path:
-        print("  Failed to find downloaded file.")
-        return
+        if not ogg_path:
+            print(f"  [{sel}] Failed to find downloaded file.")
+            continue
 
-    final_path = base_path.with_suffix(".ogg")
-    if ogg_path.suffix != ".ogg":
-        r2 = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(ogg_path), "-c:a", "libopus", "-b:a", "256k",
-             str(final_path)],
-            capture_output=True, timeout=300,
-        )
-        if final_path.exists() and final_path.stat().st_size > 10_000:
-            ogg_path.unlink()
-            ogg_path = final_path
-        else:
-            print("  Failed to convert file.")
-            return
+        final_path = base_path.with_suffix(".ogg")
+        if ogg_path.suffix != ".ogg":
+            r2 = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(ogg_path), "-c:a", "libopus", "-b:a", "256k",
+                 str(final_path)],
+                capture_output=True, timeout=300,
+            )
+            if final_path.exists() and final_path.stat().st_size > 10_000:
+                ogg_path.unlink()
+                ogg_path = final_path
+            else:
+                print(f"  [{sel}] Failed to convert file.")
+                continue
 
-    if ogg_path != final_path:
-        ogg_path.rename(final_path)
+        if ogg_path != final_path:
+            ogg_path.rename(final_path)
 
-    for f in output_dir.glob(f"{filename_base}.*"):
-        if f != final_path:
-            f.unlink(missing_ok=True)
-    for f in output_dir.glob("_tmp_get_*"):
-        if f.is_file() and f != final_path:
-            f.unlink(missing_ok=True)
+        for f in output_dir.glob(f"{filename_base}.*"):
+            if f != final_path:
+                f.unlink(missing_ok=True)
+        for f in output_dir.glob("_tmp_get_*"):
+            if f.is_file() and f != final_path:
+                f.unlink(missing_ok=True)
 
-    if fix_audio_mime_type(final_path):
-        print("  Converted video/ogg to audio/ogg")
+        if fix_audio_mime_type(final_path):
+            print(f"  [{sel}] Converted video/ogg to audio/ogg")
 
-    print(f"  Saved: {final_path}")
+        print(f"  [{sel}] Saved: {final_path}")
 
-    print("  Cropping cover art...")
-    try:
-        crop_cover_art(final_path)
-    except Exception:
-        pass
+        print(f"  [{sel}] Cropping cover art...")
+        try:
+            crop_cover_art(final_path)
+        except Exception:
+            pass
 
-    subprocess.run(["xdg-open", str(final_path)])
+        if sel == last_sel:
+            last_path = final_path
+
+    if last_path:
+        subprocess.run(["xdg-open", str(last_path)])
 
 
 def list_library() -> None:
