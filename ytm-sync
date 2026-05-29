@@ -16,17 +16,25 @@ from ytmusicapi import YTMusic
 from ytmusicapi.helpers import get_authorization, initialize_headers, sapisid_from_cookie
 
 AUTH_FILE = Path.home() / ".local" / "share" / "ytm-sync" / "auth.txt"
+COOKIE_FILE = Path.home() / ".local" / "share" / "ytm-sync" / "cookies.txt"
 CONFIG_FILE = Path.home() / ".config" / "ytm-sync" / "config.toml"
 DEFAULT_MUSIC_DIR = Path.home() / "Music"
+VERBOSE = False
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+SAFE_ASCII = set(",. -_'!()&+#:;?")
+
 def sanitize(name: str) -> str:
-    """Replace filesystem-unsafe characters in a name."""
-    return name.replace("/", "_").replace("\\", "_").replace("~", "=").strip()
+    """Replace filesystem-unsafe characters in a name.
+    Preserves alphanumerics, Unicode, and a small set of safe ASCII symbols."""
+    return "".join(
+        c if c.isalnum() or c in SAFE_ASCII or ord(c) >= 128 else "_"
+        for c in name
+    ).strip("_") or "_"
 
 
 def rel_path(full: Path, music_dir: Path) -> str:
@@ -314,6 +322,30 @@ def get_ytmusic_client() -> YTMusic:
     return YTMusic(str(AUTH_FILE))
 
 
+def write_cookie_file() -> Path | None:
+    """Write a Netscape cookie file from auth.txt for yt-dlp --cookies."""
+    if not AUTH_FILE.exists():
+        return None
+    try:
+        with open(AUTH_FILE) as f:
+            headers = json.load(f)
+        cookie_str = headers.get("cookie", "")
+        if not cookie_str:
+            return None
+        lines = ["# Netscape HTTP Cookie File"]
+        for part in cookie_str.split(";"):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            lines.append(f".youtube.com\tTRUE\t/\tTRUE\t\t{name}\t{value}")
+        COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        COOKIE_FILE.write_text("\n".join(lines) + "\n")
+        return COOKIE_FILE
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Library data
 # ---------------------------------------------------------------------------
@@ -392,6 +424,11 @@ def download_track(video_id: str, title: str, artist: str, album: str,
         "yt-dlp",
         "--embed-thumbnail", "--embed-metadata",
         "--parse-metadata", f":{title}:%(title)s",
+    ]
+    cookie = write_cookie_file()
+    if cookie:
+        cmd += ["--cookies", str(cookie)]
+    cmd += [
         "--metadata", f"title={title}",
         "--metadata", f"artist={artist}",
         "--metadata", f"album={album}",
@@ -405,14 +442,17 @@ def download_track(video_id: str, title: str, artist: str, album: str,
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=not VERBOSE, timeout=300)
 
         if result.returncode != 0:
-            stderr = result.stderr.decode()
-            if "The downloaded file is empty" in stderr or "Did not get any data blocks" in stderr:
-                print(f"    {playlist}: Rate limited / empty — {artist} - {title}")
+            if VERBOSE:
+                print(f"    {playlist}: Download failed — {artist} - {title}")
             else:
-                print(f"    {playlist}: Download failed — {artist} - {title}: {stderr.strip()}")
+                stderr = result.stderr.decode()
+                if "The downloaded file is empty" in stderr or "Did not get any data blocks" in stderr:
+                    print(f"    {playlist}: Rate limited / empty — {artist} - {title}")
+                else:
+                    print(f"    {playlist}: Download failed — {artist} - {title}: {stderr.strip()}")
             return None
 
         time.sleep(0.1)
@@ -1078,6 +1118,11 @@ def get_track(query: str, config: dict | None = None) -> None:
         cmd = [
             "yt-dlp", "--embed-thumbnail", "--embed-metadata",
             "--parse-metadata", f":{title}:%(title)s",
+        ]
+        cookie = write_cookie_file()
+        if cookie:
+            cmd += ["--cookies", str(cookie)]
+        cmd += [
             "--metadata", f"title={title}",
             "--metadata", f"artist={artists}",
             "--metadata", f"album={album}",
@@ -1088,9 +1133,10 @@ def get_track(query: str, config: dict | None = None) -> None:
             "-o", f"{tmp_base}.%(ext)s",
             url,
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=not VERBOSE, timeout=300)
         if result.returncode != 0:
-            print(f"  [{sel}] Download failed: {result.stderr.decode().strip()}")
+            msg = "" if VERBOSE else f": {result.stderr.decode().strip()}"
+            print(f"  [{sel}] Download failed{msg}")
             continue
 
         ogg_path = None
@@ -1208,6 +1254,7 @@ def _config_from_args(args) -> dict | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="YTM-Sync: Sync YouTube Music to local files")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show yt-dlp progress and full error output")
     sub    = parser.add_subparsers(dest="command", required=True)
 
     p_setup = sub.add_parser("setup",    help="Set up authentication and download path")
@@ -1234,6 +1281,8 @@ def main() -> None:
 
     try:
         args   = parser.parse_args()
+        global VERBOSE
+        VERBOSE = args.verbose
         config = _config_from_args(args)
 
         match args.command:
