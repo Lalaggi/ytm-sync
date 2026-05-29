@@ -29,19 +29,22 @@ def sanitize(name: str) -> str:
     return name.replace("/", "_").replace("\\", "_").replace("~", "=").strip()
 
 
-def rel_path(full: Path) -> str:
-    """Return a ~-relative path string for storage in content.toml.
-    Only replaces the leading home directory prefix — never a ~ inside a filename."""
-    home = str(Path.home())
-    s = str(full)
-    if s.startswith(home + "/"):
-        return "~/" + s[len(home) + 1:]
-    return s
+def rel_path(full: Path, music_dir: Path) -> str:
+    """Return a music_dir-relative path string for storage in content.toml."""
+    try:
+        return str(full.relative_to(music_dir))
+    except ValueError:
+        return str(full)
 
 
-def expand_path(p: str) -> Path:
-    """Expand a ~-relative path string back to a full Path."""
-    return Path(p.replace("~", str(Path.home())))
+def expand_path(p: str, music_dir: Path) -> Path:
+    """Expand a stored path to a full Path.
+    Handles old ~-relative paths and new music_dir-relative paths."""
+    if p.startswith("~/"):
+        return Path(p.replace("~", str(Path.home())))
+    if p.startswith("/"):
+        return Path(p)
+    return (music_dir / p).resolve()
 
 
 def make_track_entry(track: dict, music_dir: Path) -> dict:
@@ -52,7 +55,7 @@ def make_track_entry(track: dict, music_dir: Path) -> dict:
     full = music_dir / safe_artist / safe_album / f"{safe_artist} - {safe_title}.ogg"
     return {
         "youtube_id": track["video_id"],
-        "path":       rel_path(full),
+        "path":       rel_path(full, music_dir),
         "name":       track["title"],
         "artist":     track["artist"],
         "album":      track.get("album", ""),
@@ -76,7 +79,7 @@ def write_playlists(music_dir: Path, tracks: list[dict]) -> None:
         pl   = track.get("playlist", "Unknown")
         path = track.get("path", "")
         if path:
-            playlists.setdefault(pl, []).append(expand_path(path))
+            playlists.setdefault(pl, []).append(expand_path(path, music_dir))
 
     for playlist, track_paths in playlists.items():
         valid = sorted(p for p in track_paths if p.exists())
@@ -672,7 +675,7 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
             to_download.append(track)
         else:
             existing       = local_tracks[vid]
-            file_exists    = any(expand_path(e.get("path", "")).exists() for e in existing)
+            file_exists    = any(expand_path(e.get("path", ""), music_dir).exists() for e in existing)
             playlist_known = any(e.get("playlist", "").lower() == playlist.lower() for e in existing)
 
             if not file_exists:
@@ -774,7 +777,7 @@ def scan_library(config: dict | None = None) -> None:
     for entry in load_content_toml(music_dir).get("tracks", []):
         vid  = entry.get("youtube_id")
         path = entry.get("path", "")
-        if vid and path and expand_path(path).exists():
+        if vid and path and expand_path(path, music_dir).exists():
             if path not in [e.get("path") for e in tracks.get(vid, [])]:
                 tracks.setdefault(vid, []).append(entry)
 
@@ -787,7 +790,7 @@ def scan_library(config: dict | None = None) -> None:
             if not album_dir.is_dir() or album_dir.name.startswith("."):
                 continue
             for track_file in sorted(album_dir.glob("*.ogg")):
-                rp = rel_path(track_file)
+                rp = rel_path(track_file, music_dir)
                 if rp in known_paths:
                     continue
 
@@ -842,7 +845,7 @@ def fix_covers(config: dict | None = None) -> None:
         path = track.get("path", "")
         if not path:
             continue
-        fp = expand_path(path)
+        fp = expand_path(path, music_dir)
         if not fp.exists():
             skipped += 1
             continue
@@ -878,7 +881,7 @@ def fix_metadata(config: dict | None = None) -> None:
         path = track.get("path", "")
         if not path:
             continue
-        fp = expand_path(path)
+        fp = expand_path(path, music_dir)
         if not fp.exists():
             skipped += 1
             continue
@@ -944,7 +947,7 @@ def fix_metadata(config: dict | None = None) -> None:
         if not path or not track.get("name"):
             skipped += 1
             continue
-        fp = expand_path(path)
+        fp = expand_path(path, music_dir)
         if not fp.exists():
             skipped += 1
             continue
@@ -979,6 +982,8 @@ def get_track(query: str, config: dict | None = None) -> None:
     if not validate_auth():
         print("\nAuthentication required. Run 'ytm-sync setup' first.")
         sys.exit(1)
+
+    local_tracks = get_local_tracks(load_content_toml(music_dir))
 
     ytm = get_ytmusic_client()
     print(f"\n  Searching: {query}")
@@ -1045,6 +1050,7 @@ def get_track(query: str, config: dict | None = None) -> None:
     last_sel = ordered[-1]
 
     last_path = None
+    downloaded_any = False
     for sel in sorted(set(indices)):
         idx = sel - 1
         r        = results[idx]
@@ -1143,8 +1149,22 @@ def get_track(query: str, config: dict | None = None) -> None:
         except Exception:
             pass
 
+        local_tracks.setdefault(video_id, []).append(make_track_entry({
+            "video_id": video_id,
+            "title":    title,
+            "artist":   artists,
+            "album":    album,
+            "playlist": "",
+        }, music_dir))
+        downloaded_any = True
+
         if sel == last_sel:
             last_path = final_path
+
+    if downloaded_any:
+        write_content_toml(music_dir, local_tracks)
+        print("\nGenerating playlists...")
+        write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []))
 
     if last_path:
         subprocess.run(["xdg-open", str(last_path)])

@@ -17,8 +17,12 @@ except ImportError:
     sys.exit(1)
 
 
-def expand_path(p: str) -> Path:
-    return Path(p.replace("~", str(Path.home())))
+def expand_path(p: str, music_dir: Path) -> Path:
+    if p.startswith("~/"):
+        return Path(p.replace("~", str(Path.home())))
+    if p.startswith("/"):
+        return Path(p)
+    return (music_dir / p).resolve()
 
 
 def main():
@@ -42,7 +46,7 @@ def main():
         if not path:
             continue
 
-        fp = expand_path(path)
+        fp = expand_path(path, music_dir)
         if not fp.exists():
             skipped += 1
             continue
