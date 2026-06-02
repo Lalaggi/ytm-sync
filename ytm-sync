@@ -424,6 +424,7 @@ def download_track(video_id: str, title: str, artist: str, album: str,
         "--embed-thumbnail", "--embed-metadata",
         "--parse-metadata", f":{title}:%(title)s",
         "--extractor-args", "youtube:player-client=web_embedded,web",
+        "--js-runtimes", "node",
     ]
     cookie = write_cookie_file()
     if cookie:
@@ -1119,6 +1120,7 @@ def get_track(query: str, config: dict | None = None) -> None:
             "yt-dlp", "--embed-thumbnail", "--embed-metadata",
             "--parse-metadata", f":{title}:%(title)s",
             "--extractor-args", "youtube:player-client=web_embedded,web",
+            "--js-runtimes", "node",
         ]
         cookie = write_cookie_file()
         if cookie:
