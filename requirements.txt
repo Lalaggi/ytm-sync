@@ -1,3 +1,5 @@
 toml
 ytmusicapi
 yt-dlp-ejs
+Pillow
+mutagen
