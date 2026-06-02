@@ -1,0 +1,3 @@
+toml
+ytmusicapi
+yt-dlp-ejs
