@@ -85,7 +85,7 @@ def write_playlists(music_dir: Path, tracks: list[dict]) -> None:
     for track in tracks:
         pl   = track.get("playlist", "Unknown")
         path = track.get("path", "")
-        if path:
+        if path and pl:
             playlists.setdefault(pl, []).append(expand_path(path, music_dir))
 
     for playlist, track_paths in playlists.items():
@@ -1111,7 +1111,6 @@ def get_track(query: str, config: dict | None = None) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         filename_base = f"{safe_artists} - {safe_title}"
-        base_path     = output_dir / filename_base
         url           = f"https://music.youtube.com/watch?v={video_id}"
 
         print(f"\n  [{sel}] Downloading: {artists} - {title}")
@@ -1163,7 +1162,7 @@ def get_track(query: str, config: dict | None = None) -> None:
             print(f"  [{sel}] Failed to find downloaded file.")
             continue
 
-        final_path = base_path.with_suffix(".ogg")
+        final_path = output_dir / f"{filename_base}.ogg"
         if ogg_path.suffix != ".ogg":
             r2 = subprocess.run(
                 ["ffmpeg", "-y", "-i", str(ogg_path), "-c:a", "libopus", "-b:a", "256k",
