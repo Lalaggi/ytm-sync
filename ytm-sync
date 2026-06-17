@@ -27,6 +27,13 @@ VERBOSE = False
 
 SAFE_ASCII = set(",. -_'!()&+#:;?")
 
+# Strip edition suffixes like (Deluxe), (Super Deluxe) etc. from album names
+EDITION_RE = re.compile(r"\s*\([^)]*\b[Dd]eluxe\b[^)]*\)", re.IGNORECASE)
+
+def normalize_album(name: str) -> str:
+    """Remove edition suffixes from album name to avoid duplicate folders."""
+    return EDITION_RE.sub("", name).strip()
+
 def sanitize(name: str) -> str:
     """Replace filesystem-unsafe characters in a name.
     Preserves alphanumerics, Unicode, and a small set of safe ASCII symbols."""
@@ -58,7 +65,7 @@ def make_track_entry(track: dict, music_dir: Path) -> dict:
     """Build a content.toml entry dict from a YTM track dict."""
     safe_artist = sanitize(track["artist"])
     safe_title  = sanitize(track["title"])
-    safe_album  = sanitize(track.get("album") or "Unknown Album")
+    safe_album  = sanitize(normalize_album(track.get("album") or "Unknown Album"))
     full = music_dir / safe_artist / safe_album / f"{safe_artist} - {safe_title}.ogg"
     return {
         "youtube_id": track["video_id"],
@@ -83,19 +90,26 @@ def write_playlists(music_dir: Path, tracks: list[dict]) -> None:
     """Write .m3u8 playlist files (relative paths) for all playlists in a track list."""
     playlists: dict[str, list[Path]] = {}
     for track in tracks:
-        pl   = track.get("playlist", "Unknown")
+        pl   = (track.get("playlist") or "").strip()
         path = track.get("path", "")
-        if path and pl:
+        if path and pl and pl != "__GET__":
             playlists.setdefault(pl, []).append(expand_path(path, music_dir))
 
     for playlist, track_paths in playlists.items():
-        valid = sorted(p for p in track_paths if p.exists())
+        seen: set[str] = set()
+        valid: list[Path] = []
+        for p in track_paths:
+            p_str = str(p)
+            if p_str not in seen and p.exists():
+                seen.add(p_str)
+                valid.append(p)
         if not valid:
             continue
         safe_pl  = sanitize(playlist)
         pl_dir   = music_dir / safe_pl
         pl_dir.mkdir(parents=True, exist_ok=True)
         m3u_path = pl_dir / f"{safe_pl}.m3u8"
+        valid.sort(key=str)
         with open(m3u_path, "w") as f:
             f.write("#EXTM3U\n")
             for p in valid:
@@ -408,7 +422,7 @@ def download_track(video_id: str, title: str, artist: str, album: str,
                    playlist: str, music_dir: Path) -> Path | None:
     """Download a single track via yt-dlp and return the final Path on success."""
     safe_artist = sanitize(artist)
-    safe_album  = sanitize(album or "Unknown Album")
+    safe_album  = sanitize(normalize_album(album or "Unknown Album"))
     safe_title  = sanitize(title)
 
     output_dir = music_dir / safe_artist / safe_album
@@ -700,7 +714,19 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
 
     print("\nFetching YTM library...")
     ytm_tracks = fetch_ytm_library(get_ytmusic_client())
-    print(f"  {len(ytm_tracks)} tracks in YTM library")
+
+    # Deduplicate by (video_id, playlist) pair — YTM sometimes returns the same track
+    # multiple times within a single playlist
+    seen: set[tuple[str, str]] = set()
+    deduped: list[dict] = []
+    for t in ytm_tracks:
+        key = (t["video_id"], t.get("playlist", ""))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+    ytm_tracks = deduped
+
+    print(f"  {len(ytm_tracks)} unique tracks in YTM library")
 
     to_download:     list[dict] = []
     to_add_playlist: list[dict] = []
@@ -748,7 +774,13 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
             )
             if path:
                 downloaded_paths.append(path)
-                local_tracks.setdefault(track["video_id"], []).append(
+                # Remove stale entries for this video_id (paths that no longer exist)
+                vid = track["video_id"]
+                local_tracks[vid] = [
+                    e for e in local_tracks.get(vid, [])
+                    if expand_path(e.get("path", ""), music_dir).exists()
+                ]
+                local_tracks.setdefault(vid, []).append(
                     make_track_entry(track, music_dir)
                 )
 
@@ -1105,7 +1137,7 @@ def get_track(query: str, config: dict | None = None) -> None:
         album   = (r.get("album") or {}).get("name", "")
 
         safe_artists = sanitize(artists)
-        safe_album   = sanitize(album or "Unknown Album")
+        safe_album   = sanitize(normalize_album(album or "Unknown Album"))
         safe_title   = sanitize(title)
         output_dir   = music_dir / safe_artists / safe_album
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1202,7 +1234,7 @@ def get_track(query: str, config: dict | None = None) -> None:
             "title":    title,
             "artist":   artists,
             "album":    album,
-            "playlist": "",
+            "playlist": "__GET__",
         }, music_dir))
         downloaded_any = True
 
