@@ -2,7 +2,7 @@
 
 Sync your YouTube Music library to local Opus files.
 
-**Source:** [codeberg.org/el1lovescomputers/ytm-sync](https://codeberg.org/el1lovescomputers/ytm-sync)
+**Source:** [github.com/Lalaggi/ytm-sync](https://github.com/Lalaggi/ytm-sync)
 
 ## Features
 
@@ -17,16 +17,13 @@ Sync your YouTube Music library to local Opus files.
 
 ## Dependencies
 
-```bash
-pip install toml ytmusicapi yt-dlp-ejs Pillow mutagen
-```
-
-System packages: `yt-dlp`, `ffmpeg`, `python3`
+- **Python 3.12+**
+- System packages: `yt-dlp`, `ffmpeg`
 
 ## Installation
 
 ```bash
-git clone https://codeberg.org/el1lovescomputers/ytm-sync
+git clone https://github.com/Lalaggi/ytm-sync
 cd ytm-sync
 pip install -r requirements.txt
 # Optional: link to PATH
@@ -58,6 +55,12 @@ Search YTM for a track, select from results, and download it. Accepts ranges (e.
 ### `scan`
 
 Scan existing `.ogg` files on disk and rebuild `content.toml` by matching embedded YouTube URLs against the YTM library.
+
+### `dedupe`
+
+YouTube Music occasionally repoints a playlist entry at a re-released version of a song (new `video_id` + album name). ytm-sync previously downloaded both into separate album folders. `dedupe` finds such collisions (same song identity across different album folders/files), keeps one canonical copy — preferring the version currently in your YTM library — and removes the rest, rewriting `content.toml` and playlists. Dry-run by default; pass `--apply` to actually delete redundant files.
+
+> **Why songs get duplicated:** the file path is `Artist/Album/Artist - Title.ogg`. When YTM renames a release or swaps in a new upload of the same track, the path changes, so the existing file is no longer recognised and the track is re-downloaded. `sync` now keys on a stable song identity (`artist`/`title`, pinned to the album `browseId` when available) and skips re-downloading a song you already have.
 
 ### `list`
 
@@ -93,4 +96,4 @@ Rewrite embedded tags (comment, purl) from `content.toml` into each file.
 
 ## Reporting Issues
 
-https://codeberg.org/el1lovescomputers/ytm-sync/issues
+https://github.com/Lalaggi/ytm-sync/issues
