@@ -2,7 +2,7 @@
 
 Sync your YouTube Music library to local Opus files.
 
-**Source:** [github.com/Lalaggi/ytm-sync](https://github.com/Lalaggi/ytm-sync)
+**Source:** [gitlab.com/Lalaggi/ytm-sync](https://gitlab.com/Lalaggi/ytm-sync)
 
 ## Features
 
@@ -23,7 +23,7 @@ Sync your YouTube Music library to local Opus files.
 ## Installation
 
 ```bash
-git clone https://github.com/Lalaggi/ytm-sync
+git clone https://gitlab.com/Lalaggi/ytm-sync.git
 cd ytm-sync
 pip install -r requirements.txt
 # Optional: link to PATH
@@ -96,4 +96,4 @@ Rewrite embedded tags (comment, purl) from `content.toml` into each file.
 
 ## Reporting Issues
 
-https://github.com/Lalaggi/ytm-sync/issues
+https://gitlab.com/Lalaggi/ytm-sync/-/issues
