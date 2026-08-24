@@ -30,30 +30,39 @@ SAFE_ASCII = set(",. -_'!()&+#:;?")
 # Strip edition suffixes like (Deluxe), (Super Deluxe) etc. from album names
 EDITION_RE = re.compile(r"\s*\([^)]*\b[Dd]eluxe\b[^)]*\)", re.IGNORECASE)
 
+# Sanitize needs to avoid path traversal: a name that sanitizes to "." or
+# ".." would escape the music directory when used as a Path component.
+_SANITIZE_TRAVERSAL = {".", "..", ""}
+
 def normalize_album(name: str) -> str:
-    """Remove edition suffixes from album name to avoid duplicate folders."""
+    """Remove edition suffixes like (Deluxe) to avoid duplicate folders.
+
+    Previous versions collapsed case/punctuation (e.g. "Album!" == "album"),
+    which merged genuinely different releases. Now we only strip the
+    edition suffix and whitespace — the filesystem still gets a sanitized
+    name, but "Album!" and "album" stay distinct.
+    """
     if not name:
         return ""
-    name = EDITION_RE.sub("", name)
-    # Collapse case/whitespace/punctuation so small backend renames
-    # (e.g. "Running with the Wolves" vs "Running With The Wolves (EP)")
-    # map to the same folder instead of creating parallel trees.
-    collapsed = re.sub(r"[^0-9a-z]+", " ", name.lower()).strip()
-    return collapsed or name.strip()
+    name = EDITION_RE.sub("", name).strip()
+    return name.strip() or name
 
 
 def song_key(artist: str, title: str, album_id: str | None = None) -> str:
     """Stable identity for a SONG that survives album renames / re-releases.
 
-    YTM sometimes repoints a playlist entry from one upload to a re-released
-    version of the same song. That re-release gets a NEW video_id and a NEW
-    album name, which previously caused ytm-sync to re-download it as a
-    "duplicate". Keying on (artist, title) — optionally pinned to a stable
-    album browseId when available — lets us recognise the same song and skip
-    the redundant download.
+    YTM often "upgrades" a saved track — e.g. swapping a single for the
+    album version — which gives it a NEW video_id and often a new album_id.
+    Previous code pinned the identity to album_id, so those upgrades looked
+    like different songs and got re-downloaded. We now key purely on
+    (artist, title) so a re-released version is recognised as the same song
+    and handled in-place (update stored id/metadata, merge playlists) instead
+    of being re-downloaded.
+
+    `album_id` is kept as an accepted parameter for backwards compatibility
+    but ignored — callers should just pass artist + title.
     """
-    base = f"{sanitize(artist).lower()} - {sanitize(title).lower()}"
-    return f"{base}#{album_id}" if album_id else base
+    return f"{sanitize(artist).lower()} - {sanitize(title).lower()}"
 
 
 def pl_list(entry: dict) -> list[str]:
@@ -83,11 +92,26 @@ def add_playlist(entry: dict, name: str) -> None:
 
 def sanitize(name: str) -> str:
     """Replace filesystem-unsafe characters in a name.
-    Preserves alphanumerics, Unicode, and a small set of safe ASCII symbols."""
-    return "".join(
+    Preserves alphanumerics, Unicode, and a small set of safe ASCII symbols.
+    Guards against path traversal: results like "." / ".." are replaced with
+    "_" and any path separator is escaped."""
+    # Fast path: replace unsafe chars; "/" and "\\" are not in SAFE_ASCII nor
+    # alnum, so they become "_", preventing absolute or traversal components.
+    raw = "".join(
         c if c.isalnum() or c in SAFE_ASCII or ord(c) >= 128 else "_"
         for c in name
-    ).strip("_") or "_"
+    ).strip(" _")
+    if not raw or raw in _SANITIZE_TRAVERSAL:
+        return "_"
+    # Collapse any remaining traversal attempts like "..." or "./ ../"
+    # and strip leading dots that could create hidden files.
+    # If the result still looks like a traversal component, fall back to "_".
+    if raw in _SANITIZE_TRAVERSAL or raw.startswith("."):
+        # Keep single leading dot for things like "Dr. Dre" — that's fine,
+        # but a component that is *only* dots is traversal.
+        if set(raw) <= {"."}:
+            return "_"
+    return raw or "_"
 
 
 def rel_path(full: Path, music_dir: Path) -> str:
@@ -440,15 +464,16 @@ def get_local_tracks(content: dict) -> dict[str, list[dict]]:
 
 
 def build_song_index(local_tracks: dict[str, list[dict]]) -> dict[str, list[dict]]:
-    """Map song_key() -> [entries] across all local tracks."""
+    """Map song_key() -> [entries] across all local tracks.
+
+    Identity is (artist, title) only — see song_key() — so re-released
+    versions (single -> album) map to the same key and can be recognised
+    without re-downloading.
+    """
     index: dict[str, list[dict]] = {}
     for entries in local_tracks.values():
         for entry in entries:
-            key = song_key(
-                entry.get("artist", ""),
-                entry.get("name", ""),
-                entry.get("album_id", ""),
-            )
+            key = song_key(entry.get("artist", ""), entry.get("name", ""))
             index.setdefault(key, []).append(entry)
     return index
 
@@ -456,35 +481,66 @@ def build_song_index(local_tracks: dict[str, list[dict]]) -> dict[str, list[dict
 def reconcile_playlists(ytm_tracks: list[dict], local_tracks: dict[str, list[dict]]) -> None:
     """Rewrite each local entry's `playlists` to match the LIVE YTM library.
 
-    content.toml can drift from reality in two ways:
-      * a song's video_id changed (YTM re-release) — the old on-disk file
-        is still tagged with the playlist, but YTM now lists a different
-        video_id for that song, so the playlist effectively no longer contains
-        the old file;
-      * a song was removed from a playlist on YTM, but its stored
-        `playlists` entry was never cleared.
-    Rebuilding playlist membership from the live library keeps the generated
-    .m3u8 files in sync with what YTM actually shows.
+    Keyed by song identity (artist, title) rather than video_id so that a
+    YTM re-release (single -> album, new video_id) does NOT wipe the song
+    from its playlists. See song_key() — two versions of the same song share
+    the same key, so the on-disk entry keeps all live memberships even after
+    the id changed.
+
+    If the fetch was incomplete/partial (see fetch_ytm_library.failures),
+    we do NOT erase playlists — missing data means "couldn't determine",
+    not "confirmed absent" (see architectural concern in the review).
     """
-    # video_id -> set of playlist titles it currently belongs to on YTM.
+    # song_key(artist, title) -> set of playlist titles it currently belongs to.
     live: dict[str, set[str]] = {}
     for t in ytm_tracks:
-        vid = t.get("video_id")
-        pl  = t.get("playlist", "")
-        if vid and pl:
-            live.setdefault(vid, set()).add(pl)
+        pl = t.get("playlist", "")
+        if pl:
+            skey = song_key(t.get("artist", ""), t.get("title", ""))
+            live.setdefault(skey, set()).add(pl)
+
+    incomplete = bool(getattr(fetch_ytm_library, "failures", [])) or bool(getattr(fetch_ytm_library, "truncated", False))
+    if incomplete:
+        print("  Note: YTM fetch was incomplete — preserving existing playlists for items not seen (not erasing).")
 
     for entries in local_tracks.values():
         for entry in entries:
-            vid = entry.get("youtube_id", "")
-            entry["playlists"] = sorted(live.get(vid, set()))
+            skey = song_key(entry.get("artist", ""), entry.get("name", ""))
+            if incomplete and skey not in live:
+                # Couldn't determine — keep what we have instead of wiping to []
+                continue
+            if incomplete:
+                # Additive: keep existing plus live (don't remove on partial)
+                existing = set(pl_list(entry))
+                entry["playlists"] = sorted(existing | live.get(skey, set()))
+            else:
+                entry["playlists"] = sorted(live.get(skey, set()))
 
 
 def fetch_ytm_library(ytm: YTMusic) -> list[dict]:
-    """Fetch all tracks from every YTM library playlist."""
-    tracks = []
+    """Fetch all tracks from every YTM library playlist.
+
+    Returns a plain list of track dicts. Failures for individual playlists
+    are tracked on ``fetch_ytm_library.failures`` and truncation on
+    ``fetch_ytm_library.truncated`` so callers doing destructive work can
+    tell "confirmed absent" from "couldn't determine". See also the
+    architectural note in dedupe/sync about partial data.
+    """
+    tracks: list[dict] = []
+    failures: list[str] = []
+    truncated = False
     print("  Fetching library playlists...")
-    playlists = ytm.get_library_playlists(limit=1000)
+    try:
+        playlists = ytm.get_library_playlists(limit=1000)
+    except Exception as e:
+        print(f"  Failed to fetch library playlists: {e}")
+        fetch_ytm_library.failures = ["<library playlists>"]
+        fetch_ytm_library.truncated = False
+        return []
+
+    if len(playlists) >= 1000:
+        print("  Warning: library playlist count hit limit=1000 — results may be truncated (paginate not implemented).")
+        truncated = True
 
     for playlist in playlists:
         playlist_id    = playlist.get("playlistId")
@@ -497,7 +553,11 @@ def fetch_ytm_library(ytm: YTMusic) -> list[dict]:
         print(f"    Fetching: {playlist_title}")
         try:
             data = ytm.get_playlist(playlist_id, limit=10000)
-            for item in data.get("tracks", []):
+            yt_tracks = data.get("tracks", [])
+            if len(yt_tracks) >= 10000:
+                print(f"    Warning: playlist '{playlist_title}' hit limit=10000 — truncated.")
+                truncated = True
+            for item in yt_tracks:
                 video_id = item.get("videoId")
                 if video_id:
                     album = item.get("album") or {}
@@ -511,8 +571,17 @@ def fetch_ytm_library(ytm: YTMusic) -> list[dict]:
                     })
         except Exception as e:
             print(f"    Failed to fetch {playlist_title}: {e}")
+            failures.append(playlist_title)
 
+    fetch_ytm_library.failures = failures  # type: ignore[attr-defined]
+    fetch_ytm_library.truncated = truncated  # type: ignore[attr-defined]
+    if failures:
+        print(f"  Warning: {len(failures)} playlist(s) failed to fetch — results are partial; destructive actions will be skipped.")
     return tracks
+
+# Initialise attributes for callers that inspect them before first fetch
+fetch_ytm_library.failures = []  # type: ignore[attr-defined]
+fetch_ytm_library.truncated = False  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -583,17 +652,7 @@ def download_track(video_id: str, title: str, artist: str, album: str,
                 break
 
         if not ogg_path:
-            now = time.time()
-            for ext in (".opus", ".ogg", ".webm"):
-                for p in output_dir.glob(f"*{ext}"):
-                    if p.stat().st_size > 10_000 and (now - p.stat().st_mtime) < 120:
-                        ogg_path = p
-                        break
-                if ogg_path:
-                    break
-
-        if not ogg_path:
-            print(f"    {playlist}: Could not locate downloaded file — {artist} - {title}")
+            print(f"    {playlist}: Could not locate downloaded file — {artist} - {title} (expected _tmp_{video_id}.*)")
             return None
 
         if ogg_path.stat().st_size < 1_000:
@@ -606,11 +665,10 @@ def download_track(video_id: str, title: str, artist: str, album: str,
             final_path.unlink(missing_ok=True)
             ogg_path.rename(final_path)
 
+        # Clean only leftover temp files for this video_id — never touch
+        # unrelated .opus/.webm/.webp in the same album directory.
         for f in output_dir.glob(f"_tmp_{video_id}*"):
             if f.is_file() and f != final_path:
-                f.unlink(missing_ok=True)
-        for f in output_dir.glob("*"):
-            if f.is_file() and f != final_path and f.suffix in (".webm", ".opus", ".tmp", ".webp"):
                 f.unlink(missing_ok=True)
 
         print(f"    {playlist}: {artist} - {title}")
@@ -634,21 +692,27 @@ def fix_audio_mime_type(filepath: Path) -> bool:
         if mime_type != "video/ogg":
             return False
 
-        # Extract cover art (first frame) as JPEG
+        # Extract cover art (first frame) as JPEG — best effort
         cover_path = filepath.with_suffix(".jpg")
-        subprocess.run(
+        cov = subprocess.run(
             ["ffmpeg", "-y", "-i", str(filepath), "-vframes", "1", "-update", "1", str(cover_path)],
             capture_output=True, timeout=30,
         )
-        if not cover_path.exists() or cover_path.stat().st_size < 1000:
+        if cov.returncode != 0 or not cover_path.exists() or cover_path.stat().st_size < 1000:
             cover_path.unlink(missing_ok=True)
 
         # Convert to audio-only opus
         fixed_path = filepath.with_stem(filepath.stem + "_fixed")
-        subprocess.run(
+        res = subprocess.run(
             ["ffmpeg", "-y", "-i", str(filepath), "-vn", "-c:a", "libopus", "-b:a", "256k", str(fixed_path)],
             capture_output=True, timeout=300,
         )
+        if res.returncode != 0:
+            # ffmpeg failed — don't leave a broken fixed file
+            if fixed_path.exists():
+                fixed_path.unlink(missing_ok=True)
+            cover_path.unlink(missing_ok=True)
+            return False
 
         if fixed_path.exists() and fixed_path.stat().st_size > 1000:
             if cover_path.exists():
@@ -678,6 +742,86 @@ def fix_audio_mime_type(filepath: Path) -> bool:
     except Exception as e:
         print(f"    fix_audio_mime_type exception: {e}")
     return False
+
+
+def retag_track(filepath: Path, track: dict) -> bool:
+    """Update embedded Vorbis/Opus tags on an existing file when YTM re-releases
+    a song (new video_id/album). Keeps the on-disk file's comment/purl in sync
+    with content.toml so `scan` and future dedupe see the current id.
+
+    Best-effort: returns True if tags were written, False otherwise. Never
+    raises — caller should treat failures as non-fatal.
+    """
+    try:
+        ext = filepath.suffix.lower()
+        url = f"https://music.youtube.com/watch?v={track.get('video_id', '')}"
+        title  = track.get("title", "")
+        artist = track.get("artist", "")
+        album  = track.get("album", "")
+
+        if ext in (".ogg", ".opus"):
+            from mutagen.oggopus import OggOpus
+            audio = OggOpus(str(filepath))
+            if title:
+                audio["title"] = title
+            if artist:
+                audio["artist"] = artist
+            if album:
+                audio["album"] = album
+            if url and track.get("video_id"):
+                audio["comment"] = url
+                audio["purl"] = url
+            audio.save()
+            return True
+
+        if ext == ".m4a":
+            from mutagen.mp4 import MP4
+            audio = MP4(str(filepath))
+            if audio.tags is None:
+                audio.add_tags()
+            if title:
+                audio.tags["\xa9nam"] = title
+            if artist:
+                audio.tags["\xa9ART"] = artist
+            if album:
+                audio.tags["\xa9alb"] = album
+            if url:
+                audio.tags["comment"] = url
+                audio.tags["purl"] = url
+            audio.save()
+            return True
+
+        if ext == ".flac":
+            from mutagen.flac import FLAC
+            audio = FLAC(str(filepath))
+            if title:
+                audio["title"] = [title]
+            if artist:
+                audio["artist"] = [artist]
+            if album:
+                audio["album"] = [album]
+            if url and track.get("video_id"):
+                audio["comment"] = [url]
+                audio["purl"] = [url]
+            audio.save()
+            return True
+
+        # Generic fallback via mutagen.File
+        import mutagen
+        audio = mutagen.File(str(filepath))
+        if audio is None:
+            return False
+        if title:
+            audio["title"] = title
+        if artist:
+            audio["artist"] = artist
+        if album:
+            audio["album"] = album
+        audio.save()
+        return True
+    except Exception as e:
+        print(f"    Warning: retag failed for {filepath.name}: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -775,6 +919,62 @@ def crop_cover_art(filepath: Path) -> bool:
                 audio.save()
             return changed
 
+        elif ext == ".mp3":
+            from mutagen.id3 import ID3, APIC, ID3NoHeaderError
+            try:
+                tags = ID3(str(filepath))
+            except ID3NoHeaderError:
+                return False
+            changed = False
+            for key in list(tags.keys()):
+                if key.startswith("APIC"):
+                    apic = tags[key]
+                    img = Image.open(io.BytesIO(apic.data))
+                    w, h = img.size
+                    if w == h:
+                        continue
+                    size = min(w, h)
+                    left = (w - size) // 2
+                    top = (h - size) // 2
+                    out = io.BytesIO()
+                    fmt = img.format or "JPEG"
+                    img.crop((left, top, left + size, top + size)).save(out, format=fmt)
+                    apic.data = out.getvalue()
+                    changed = True
+                    break
+            if changed:
+                tags.save(str(filepath))
+            return changed
+
+        elif ext in (".aiff", ".aif", ".wav"):
+            from mutagen.aiff import AIFF
+            try:
+                audio = AIFF(str(filepath))
+            except Exception:
+                return False
+            if audio.tags is None:
+                return False
+            changed = False
+            for key in list(audio.tags.keys()):
+                if key.startswith("APIC"):
+                    apic = audio.tags[key]
+                    img = Image.open(io.BytesIO(apic.data))
+                    w, h = img.size
+                    if w == h:
+                        continue
+                    size = min(w, h)
+                    left = (w - size) // 2
+                    top = (h - size) // 2
+                    out = io.BytesIO()
+                    fmt = img.format or "JPEG"
+                    img.crop((left, top, left + size, top + size)).save(out, format=fmt)
+                    apic.data = out.getvalue()
+                    changed = True
+                    break
+            if changed:
+                audio.save()
+            return changed
+
     except Exception as e:
         print(f"    crop_cover_art warning: {filepath.name}: {e}")
 
@@ -811,11 +1011,47 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
 
     print("\nLoading local library...")
     local_tracks = get_local_tracks(load_content_toml(music_dir))
+    # Deduplicate index entries that point to the same on-disk file.
+    # Older sync runs created one entry per (video_id, playlist); the
+    # canonical model is one entry per file with a `playlists` array.
+    # Merge any duplicate paths so a song in N playlists is stored once.
+    _index_dupes = 0
+    _seen_paths: dict[str, dict] = {}
+    for vid in list(local_tracks.keys()):
+        kept: list[dict] = []
+        for entry in local_tracks[vid]:
+            p = entry.get("path", "")
+            if p in _seen_paths:
+                _index_dupes += 1
+                for pl in pl_list(entry):
+                    add_playlist(_seen_paths[p], pl)
+                continue
+            _seen_paths[p] = entry
+            kept.append(entry)
+        if len(kept) != len(local_tracks[vid]):
+            local_tracks[vid] = kept
+            if not kept:
+                del local_tracks[vid]
+    # Also handle duplicates that crossed video_id boundaries: an entry
+    # merged above may have been under a different vid; ensure the survivor
+    # stays but the duplicate's vid list no longer contains it. The loop
+    # above already covers it because _seen_paths is global.
+    if _index_dupes:
+        print(f"  Merged {_index_dupes} duplicate index entries (same path, different playlists)")
+
     song_index = build_song_index(local_tracks)
     print(f"  {len(local_tracks)} tracks in content.toml")
 
     print("\nFetching YTM library...")
     ytm_tracks = fetch_ytm_library(get_ytmusic_client())
+
+    # Snapshot playlists before reconcile so we can detect whether
+    # reconcile/metadata updates actually changed anything and avoid
+    # rewriting content.toml every run when the library is already in sync.
+    _snap: dict[int, list[str]] = {
+        id(e): sorted(pl_list(e))
+        for entries in local_tracks.values() for e in entries
+    }
 
     # Reconcile stored playlist membership with the live library so generated
     # .m3u8 files match what YTM actually shows (drops drifted/removed tracks).
@@ -834,69 +1070,112 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
 
     print(f"  {len(ytm_tracks)} unique tracks in YTM library")
 
-    to_download:     list[dict] = []
-    to_add_playlist: list[dict] = []
-    to_refresh:      list[dict] = []  # same song already on disk, just update metadata
-
+    # ------------------------------------------------------------------
+    # Classify live tracks by SONG identity (artist+title), not video_id,
+    # so the same song in multiple playlists is handled as ONE unit and
+    # re-releases (single -> album, new video_id) are recognised without
+    # re-downloading. A song in N playlists -> one on-disk file with N
+    # entries in its `playlists` list. This is the "same stuff behind
+    # dedupe" now used proactively during sync.
+    # ------------------------------------------------------------------
     def _on_disk(entries: list[dict]) -> bool:
         return any(expand_path(e.get("path", ""), music_dir).exists() for e in entries)
 
-    def _known(existing: object, playlist: str) -> bool:
-        if not isinstance(existing, (list, tuple)):
-            return False
-        names = [p.lower() for e in existing if isinstance(e, dict)
-                for p in pl_list(e)]
-        return playlist.lower() in names
+    from collections import defaultdict as _dd
 
+    # Group live tracks by song identity. Each key collects every
+    # occurrence across playlists. Filtering is applied before grouping
+    # so a filtered sync only plans the requested playlists.
+    song_to_tracks: dict[str, list[dict]] = _dd(list)
     for track in ytm_tracks:
-        vid      = track["video_id"]
-        playlist = track.get("playlist", "")
-        skey     = song_key(track["artist"], track["title"], track.get("album_id", ""))
+        pl = track.get("playlist", "")
+        if filters and pl.lower() not in filters:
+            continue
+        skey = song_key(track.get("artist", ""), track.get("title", ""))
+        song_to_tracks[skey].append(track)
 
-        if filters and playlist.lower() not in filters:
+    # Decide per-song: keep/re-release (in-place) vs download once.
+    # to_download holds one representative track per genuinely new song
+    # and the full set of playlists that song belongs to.
+    to_download: list[dict] = []
+    new_song_playlists: dict[str, list[str]] = {}
+    # (existing entry, representative live track) for in-place metadata refresh
+    to_retag: list[tuple[dict, dict]] = []
+    # track how many existing songs gain metadata updates (informational)
+    refreshed = 0
+
+    for skey, tracks in song_to_tracks.items():
+        existing = song_index.get(skey, [])
+        on_disk = [e for e in existing if expand_path(e.get("path", ""), music_dir).exists()]
+
+        if on_disk:
+            # Already have this song on disk — keep it, don't download.
+            # Use the first on-disk file as canonical (if multiple exist,
+            # dedupe handles collapsing them; we just update the one we keep).
+            canonical = on_disk[0]
+            # Reconcile already merged playlists by song identity; ensure
+            # every playlist in this group is present (idempotent).
+            for t in tracks:
+                add_playlist(canonical, t.get("playlist", ""))
+
+            # If YTM now serves this song under a different video_id or
+            # album (re-release), update the stored identity in-place and
+            # queue a re-tag so the file's embedded comment/purl stays in
+            # sync with content.toml (keeps scan/dedupe correct).
+            rep = tracks[0]
+            live_vid = rep.get("video_id", "")
+            live_album = rep.get("album", "")
+            live_album_id = rep.get("album_id", "")
+            if (canonical.get("youtube_id") != live_vid
+                    or canonical.get("album_id", "") != live_album_id
+                    or canonical.get("album", "") != live_album):
+                # Only count as a refresh if the id/album actually change;
+                # playlist-only changes were already handled above.
+                if (canonical.get("youtube_id") != live_vid
+                        or canonical.get("album_id", "") != live_album_id):
+                    to_retag.append((canonical, rep))
+                    refreshed += 1
+                canonical["youtube_id"] = live_vid
+                if live_album:
+                    canonical["album"] = live_album
+                if live_album_id is not None:
+                    canonical["album_id"] = live_album_id
             continue
 
-        # Case 1: exact video_id already downloaded & present on disk.
-        if vid in local_tracks and _on_disk(local_tracks[vid]):
-            playlist_known = _known(local_tracks.get(vid), playlist)
-            if not playlist_known:
-                to_add_playlist.append(track)
-            continue
-
-        # Case 2: same SONG (artist/title[/album_id]) already on disk under a
-        # different video_id — YTM repointed this entry at a re-released version.
-        # Don't re-download; just refresh the stored metadata to the current id.
-        if skey in song_index and _on_disk(song_index[skey]):
-            playlist_known = _known(song_index.get(skey), playlist)
-            if not playlist_known:
-                to_add_playlist.append(track)
-            else:
-                to_refresh.append(track)
-            continue
-
-        # Case 3: genuinely new — download it.
-        to_download.append(track)
+        # Genuinely new song — download ONCE regardless of how many
+        # playlists contain it. Keep one representative track for yt-dlp
+        # (which uses the track's playlist as genre); merge all playlists
+        # onto the single entry after download.
+        rep = tracks[0]
+        to_download.append(rep)
+        pls = sorted({t.get("playlist", "") for t in tracks if t.get("playlist", "")})
+        new_song_playlists[skey] = pls
 
     print(f"\n  {len(to_download)} tracks to download")
-    print(f"  {len(to_add_playlist)} tracks to add to new playlists")
+    if refreshed:
+        print(f"  {refreshed} tracks to refresh (re-release metadata update)")
 
-    if not to_download and not to_add_playlist:
-        print("\nLibrary is up to date!")
+    if not to_download and not to_retag:
+        # No new files and no id/album refreshes. Check whether reconcile
+        # or the per-song playlist merges (or the index-path dedupe above)
+        # actually changed any entry.
+        dirty = _index_dupes > 0
+        if not dirty:
+            for entries in local_tracks.values():
+                for e in entries:
+                    if sorted(pl_list(e)) != _snap.get(id(e), []):
+                        dirty = True
+                        break
+                if dirty:
+                    break
+        if dirty:
+            write_content_toml(music_dir, local_tracks)
+            print("\nGenerating playlists...")
+            write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []))
+            print("\nPlaylists updated.")
+        else:
+            print("\nLibrary is up to date!")
         return
-
-    for track in to_add_playlist:
-        vid      = track["video_id"]
-        playlist = track.get("playlist", "")
-        # Add the playlist to the song's existing entry rather than creating a
-        # second entry for the same file (one entry per song, many playlists).
-        target = None
-        if vid in local_tracks:
-            target = next((e for e in local_tracks[vid]
-                           if expand_path(e.get("path", ""), music_dir).exists()), None)
-        if target is None:
-            target = make_track_entry(track, music_dir)
-            local_tracks.setdefault(vid, []).append(target)
-        add_playlist(target, playlist)
 
     downloaded_paths: list[Path] = []
     if to_download:
@@ -904,6 +1183,7 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
         pad = len(str(len(to_download)))
         for i, track in enumerate(to_download, 1):
             print(f"  [{i:0{pad}d}/{len(to_download)}] ", end="", flush=True)
+            # Use the first playlist as genre; the full set is merged after.
             path = download_track(
                 track["video_id"], track["title"], track["artist"],
                 track.get("album", ""), track.get("playlist", ""),
@@ -911,15 +1191,22 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
             )
             if path:
                 downloaded_paths.append(path)
-                # Remove stale entries for this video_id (paths that no longer exist)
+                skey = song_key(track.get("artist", ""), track.get("title", ""))
                 vid = track["video_id"]
+                # Collapse any stale entries for this video_id (paths gone).
                 local_tracks[vid] = [
                     e for e in local_tracks.get(vid, [])
                     if expand_path(e.get("path", ""), music_dir).exists()
                 ]
-                local_tracks.setdefault(vid, []).append(
-                    make_track_entry(track, music_dir)
-                )
+                entry = make_track_entry(track, music_dir)
+                # A new song in multiple playlists gets ONE entry with ALL
+                # its playlists — this is the core fix for the multi-playlist
+                # duplicate that previously produced one entry per playlist.
+                for pl in new_song_playlists.get(skey, []):
+                    add_playlist(entry, pl)
+                local_tracks.setdefault(vid, []).append(entry)
+            else:
+                print("  (skipped — download failed)")
 
         print(f"\nDownloaded {len(downloaded_paths)}/{len(to_download)} tracks")
 
@@ -931,22 +1218,20 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
                 except Exception as e:
                     print(f"    Warning: Crop failed for {path.name}: {e}")
 
-    if downloaded_paths or to_add_playlist:
-        # Refresh metadata for songs YTM now serves under a re-released
-        # video_id/album: point the existing on-disk entry at the current id
-        # so future syncs recognise it (no re-download).
-        for track in to_refresh:
-            skey = song_key(track["artist"], track["title"], track.get("album_id", ""))
-            for entry in song_index.get(skey, []):
-                if expand_path(entry.get("path", ""), music_dir).exists():
-                    entry["youtube_id"] = track["video_id"]
-                    entry["album"]      = track.get("album", entry.get("album", ""))
-                    entry["album_id"]   = track.get("album_id", entry.get("album_id", ""))
-                    add_playlist(entry, track.get("playlist", ""))
+    # Re-tag existing files whose id/album changed (re-release).
+    if to_retag:
+        print(f"\nUpdating metadata for {len(to_retag)} re-released track(s)...")
+        for entry, track in to_retag:
+            fp = expand_path(entry.get("path", ""), music_dir)
+            if fp.exists():
+                try:
+                    retag_track(fp, track)
+                except Exception as e:
+                    print(f"    Warning: retag failed for {fp.name}: {e}")
 
-        write_content_toml(music_dir, local_tracks)
-        print("\nGenerating playlists...")
-        write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []))
+    write_content_toml(music_dir, local_tracks)
+    print("\nGenerating playlists...")
+    write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []))
 
 
 def scan_library(config: dict | None = None) -> None:
@@ -1085,21 +1370,23 @@ def scan_library(config: dict | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 def dedupe_library(apply: bool = False, config: dict | None = None) -> None:
-    """Collapse genuine duplicate copies of a song to a single canonical file.
+    """Safety-net cleanup for duplicate files left by older sync runs.
 
-    Two situations produce redundant copies:
+    Modern `sync` handles re-releases in-place (updates the stored
+    video_id/album and merges playlists, never re-downloads). This command
+    remains for index/file drift:
 
     1. Index corruption — content.toml lists the same on-disk file more than
-       once. Harmless to the files; we just de-duplicate the index.
-    2. YTM re-release drift — YTM repoints a playlist entry at a re-released
-       version of a song (new video_id + album name) while the old version is
-       still around. If your library currently lists only ONE of the two
-       video_ids, the other is a stale copy and safe to remove. If BOTH are
-       still listed we keep both (they are both legitimately in your library).
+       once. Harmless to the files; we just de-duplicate the index by
+       merging their `playlists` arrays.
+    2. Stale file copies — two different on-disk files for the same song
+       (same artist/title, e.g. single vs album version). If your library
+       currently lists only ONE of the two video_ids, the other is stale and
+       safe to remove. If BOTH are still live we keep both.
 
-    This command is deliberately conservative: it NEVER deletes a file unless
-    another on-disk file of the *same song* (same artist/title) is being kept.
-    Dry-run by default; pass --apply to actually remove files and rewrite
+    Deliberately conservative: NEVER deletes a file unless another on-disk
+    file of the same song (same artist/title) is being kept. Dry-run by
+    default; pass --apply to actually remove files and rewrite
     content.toml + playlists.
     """
     if config is None:
@@ -1145,24 +1432,29 @@ def dedupe_library(apply: bool = False, config: dict | None = None) -> None:
     live_ids = _current_ytm_ids()
 
     redundant: list[dict] = []
-    for key, entries in sorted(clusters.items()):
-        # A cluster is only a duplicate if it has MORE THAN ONE distinct file.
-        distinct_paths = {expand_path(e.get("path", ""), music_dir) for e in entries}
-        if len(distinct_paths) < 2:
-            continue
+    if live_ids is None:
+        print("\n  Live YTM IDs unavailable/incomplete — file deletion will be skipped.")
+        print("  Only index deduplication (same path) will be considered.")
+        # Mark no file-level duplicates as redundant; index dupes handled separately.
+    else:
+        for key, entries in sorted(clusters.items()):
+            # A cluster is only a duplicate if it has MORE THAN ONE distinct file.
+            distinct_paths = {expand_path(e.get("path", ""), music_dir) for e in entries}
+            if len(distinct_paths) < 2:
+                continue
 
-        # If every video_id in the cluster is still live in YTM, they are all
-        # legitimately in your library -> keep all, do not delete.
-        ids = {e.get("youtube_id", "") for e in entries}
-        if ids and ids.issubset(live_ids):
-            continue
+            # If every video_id in the cluster is still live in YTM, they are all
+            # legitimately in your library -> keep all, do not delete.
+            ids = {e.get("youtube_id", "") for e in entries}
+            if ids and ids.issubset(live_ids):
+                continue
 
-        # Otherwise, keep the file whose video_id is live (prefer that); if none
-        # are live, keep the newest on disk. Mark the rest for removal.
-        keep = next((e for e in entries if e.get("youtube_id") in live_ids), None)
-        if keep is None:
-            keep = max(entries, key=lambda e: expand_path(e.get("path", ""), music_dir).stat().st_mtime)
-        redundant.extend(e for e in entries if e is not keep)
+            # Otherwise, keep the file whose video_id is live (prefer that); if none
+            # are live, keep the newest on disk. Mark the rest for removal.
+            keep = next((e for e in entries if e.get("youtube_id") in live_ids), None)
+            if keep is None:
+                keep = max(entries, key=lambda e: expand_path(e.get("path", ""), music_dir).stat().st_mtime)
+            redundant.extend(e for e in entries if e is not keep)
 
     if index_dupes:
         print(f"\n  Index: {index_dupes} duplicate content.toml entries (same path) will be dropped.")
@@ -1204,16 +1496,30 @@ def dedupe_library(apply: bool = False, config: dict | None = None) -> None:
     write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []))
 
 
-def _current_ytm_ids() -> set[str]:
-    """Return the set of video_ids currently in the YTM library (best effort)."""
+def _current_ytm_ids() -> set[str] | None:
+    """Return the set of video_ids currently in the YTM library, or None if
+    the fetch was incomplete/failed (caller must not treat absence as authoritative)."""
     try:
-        if validate_auth():
-            ids = {t["video_id"] for t in fetch_ytm_library(get_ytmusic_client())}
-            if ids:
-                return ids
+        if not validate_auth():
+            print("  Warning: Cannot validate auth — YTM IDs unavailable.")
+            return None
+        ids = {t["video_id"] for t in fetch_ytm_library(get_ytmusic_client())}
+        # If fetch reported failures/truncation, we cannot trust absence.
+        if getattr(fetch_ytm_library, "failures", []):
+            print(f"  Warning: YTM fetch had failures {fetch_ytm_library.failures!r} — IDs are partial.")
+            return None
+        if getattr(fetch_ytm_library, "truncated", False):
+            print("  Warning: YTM fetch was truncated — IDs are incomplete.")
+            return None
+        if not ids:
+            # Empty but no failures — empty library is plausible, but
+            # deleting on that basis is too risky; treat as incomplete.
+            print("  Warning: YTM returned no IDs — not using for destructive decisions.")
+            return None
+        return ids
     except Exception as e:
         print(f"  Warning: Could not fetch YTM IDs: {e}")
-    return set()
+        return None
 
 
 def fix_covers(config: dict | None = None) -> None:
@@ -1252,7 +1558,13 @@ def fix_covers(config: dict | None = None) -> None:
 
 
 def fix_playlists(config: dict | None = None) -> None:
-    """Regenerate all .m3u8 playlist files from content.toml."""
+    """Regenerate all .m3u8 playlist files from content.toml.
+
+    Local-only by default. If authentication is available, playlist
+    membership is reconciled against the live YTM library; otherwise
+    playlists are rebuilt purely from content.toml. On partial fetch,
+    existing memberships are preserved (see reconcile_playlists).
+    """
     if config is None:
         config = load_config()
     music_dir = get_music_dir(config)
@@ -1266,21 +1578,31 @@ def fix_playlists(config: dict | None = None) -> None:
         print("\n  No content.toml found. Run 'scan' first.")
         return
 
-    if not validate_auth():
-        print("\nAuthentication required. Run 'ytm-sync setup' first.")
-        sys.exit(1)
-
     tracks = load_content_toml(music_dir).get("tracks", [])
-    # Reconcile stored playlist membership with the live YTM library so the
-    # regenerated .m3u8 files match what YTM actually shows.
     local_tracks = get_local_tracks({"tracks": tracks})
-    reconcile_playlists(fetch_ytm_library(get_ytmusic_client()), local_tracks)
-    write_content_toml(music_dir, local_tracks)
-    write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []))
+
+    if validate_auth():
+        try:
+            ytm_tracks = fetch_ytm_library(get_ytmusic_client())
+            reconcile_playlists(ytm_tracks, local_tracks)
+            write_content_toml(music_dir, local_tracks)
+            # Reload to reflect any merges
+            tracks = load_content_toml(music_dir).get("tracks", [])
+        except Exception as e:
+            print(f"  Warning: could not reconcile with YTM ({e}) — regenerating from local index only.")
+    else:
+        print("  No valid auth — regenerating playlists from local content.toml only.")
+
+    write_playlists(music_dir, tracks)
 
 
 def fix_metadata(config: dict | None = None) -> None:
-    """Rewrite embedded metadata tags for all tracks from content.toml."""
+    """Rewrite embedded metadata tags for all tracks from content.toml.
+
+    Correctly handles the formats actually produced by ytm-sync (.ogg Opus)
+    as well as legacy .m4a/.flac. Previously this always used MP4 which
+    fails on Opus files.
+    """
     if config is None:
         config = load_config()
     music_dir = get_music_dir(config)
@@ -1303,15 +1625,63 @@ def fix_metadata(config: dict | None = None) -> None:
             skipped += 1
             continue
         try:
-            from mutagen.mp4 import MP4
-            audio = MP4(str(fp))
-            if audio.tags is None:
-                audio.add_tags()
-            audio.tags["\xa9nam"] = track["name"]
-            audio.tags["\xa9ART"] = track.get("artist", "")
-            audio.tags["\xa9alb"] = track.get("album", "")
-            audio.tags["\xa9gen"] = ", ".join(pl_list(track))
-            audio.save()
+            ext = fp.suffix.lower()
+            vid = track.get("youtube_id", "")
+            url = f"https://music.youtube.com/watch?v={vid}" if vid and not vid.startswith("local-") else ""
+            genre = ", ".join(pl_list(track))
+
+            if ext in (".ogg", ".opus"):
+                from mutagen.oggopus import OggOpus
+                audio = OggOpus(str(fp))
+                audio["title"] = track["name"]
+                audio["artist"] = track.get("artist", "")
+                audio["album"] = track.get("album", "")
+                if genre:
+                    audio["genre"] = genre
+                if url:
+                    audio["comment"] = url
+                    audio["purl"] = url
+                audio.save()
+            elif ext == ".m4a":
+                from mutagen.mp4 import MP4
+                audio = MP4(str(fp))
+                if audio.tags is None:
+                    audio.add_tags()
+                audio.tags["\xa9nam"] = track["name"]
+                audio.tags["\xa9ART"] = track.get("artist", "")
+                audio.tags["\xa9alb"] = track.get("album", "")
+                audio.tags["\xa9gen"] = genre
+                if url:
+                    audio.tags["comment"] = url
+                    audio.tags["purl"] = url
+                audio.save()
+            elif ext == ".flac":
+                from mutagen.flac import FLAC
+                audio = FLAC(str(fp))
+                audio["title"] = [track["name"]]
+                audio["artist"] = [track.get("artist", "")]
+                audio["album"] = [track.get("album", "")]
+                if genre:
+                    audio["genre"] = [genre]
+                if url:
+                    audio["comment"] = [url]
+                    audio["purl"] = [url]
+                audio.save()
+            else:
+                import mutagen
+                audio = mutagen.File(str(fp))
+                if audio is None:
+                    raise ValueError("mutagen could not identify file")
+                # Generic Vorbis-style fallback
+                if hasattr(audio, "__setitem__"):
+                    audio["title"] = track["name"]
+                    audio["artist"] = track.get("artist", "")
+                    audio["album"] = track.get("album", "")
+                    if genre:
+                        audio["genre"] = genre
+                    audio.save()
+                else:
+                    raise ValueError(f"unsupported type {ext}")
             fixed += 1
             print(f"    Fixed: {fp.name}")
         except Exception as e:
@@ -1587,7 +1957,7 @@ def main() -> None:
     ]:
         sub.add_parser(name, help=help_str).add_argument("-p", "--path", help="Music directory override")
 
-    p_dedupe = sub.add_parser("dedupe", help="Collapse songs YTM serves under multiple releases")
+    p_dedupe = sub.add_parser("dedupe", help="Safety-net: merge duplicate index entries and remove stale file copies")
     p_dedupe.add_argument("--apply", action="store_true", help="Actually remove redundant copies")
     p_dedupe.add_argument("-p", "--path", help="Music directory override")
 

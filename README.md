@@ -57,7 +57,9 @@ Rebuild `content.toml` from existing `.ogg` files by matching embedded YouTube U
 
 ### `dedupe`
 
-Finds duplicate downloads caused when YTM repoints a playlist entry at a re-released version (same song, new `video_id` / album). Keeps one canonical copy — preferring the version in your library — and removes the rest. Dry-run by default; `--apply` to delete.
+Safety-net cleanup for duplicate files that may have been created by older versions. Finds stale copies of a song (same `artist`/`title` in different files, e.g. single vs album version) and removes the redundant one; index duplicates (same path, split across `playlists`) are merged. Dry-run by default; `--apply` to delete.
+
+> **New:** `sync` now handles re-releases in-place — when YTM swaps a track for a re-released version (new `video_id`/`album`), the local file's **ID and embedded metadata are updated** and its playlist memberships merged. Sync never re-downloads the same song in its entirety and a song in multiple playlists is stored as **one file with a `playlists = [...]` list**.
 
 ### Other commands
 
