@@ -161,12 +161,22 @@ def write_content_toml(music_dir: Path, local_tracks: dict[str, list[dict]]) -> 
     print(f"  Updated {content_file}")
 
 
-def write_playlists(music_dir: Path, tracks: list[dict]) -> None:
-    """Write .m3u8 playlist files (relative paths) for all playlists in a track list."""
+def write_playlists(music_dir: Path, tracks: list[dict],
+                    only_playlists: list[str] | None = None) -> None:
+    """Write .m3u8 playlist files (relative paths) for all playlists in a track list.
+
+    If `only_playlists` is given (lowercase filter strings from a filtered
+    `sync`), only those playlists are written — other .m3u8 files are left
+    untouched so a filtered sync never creates/rewrites the rest of the
+    library.
+    """
+    filter_set = {p.lower() for p in only_playlists} if only_playlists is not None else None
     playlists: dict[str, list[Path]] = {}
     for track in tracks:
         path = track.get("path", "")
         for pl in pl_list(track):
+            if filter_set is not None and pl.lower() not in filter_set:
+                continue
             if path and pl and pl != "__GET__":
                 playlists.setdefault(pl, []).append(expand_path(path, music_dir))
 
@@ -478,7 +488,8 @@ def build_song_index(local_tracks: dict[str, list[dict]]) -> dict[str, list[dict
     return index
 
 
-def reconcile_playlists(ytm_tracks: list[dict], local_tracks: dict[str, list[dict]]) -> None:
+def reconcile_playlists(ytm_tracks: list[dict], local_tracks: dict[str, list[dict]],
+                        only_playlists: list[str] | None = None) -> None:
     """Rewrite each local entry's `playlists` to match the LIVE YTM library.
 
     Keyed by song identity (artist, title) rather than video_id so that a
@@ -490,6 +501,11 @@ def reconcile_playlists(ytm_tracks: list[dict], local_tracks: dict[str, list[dic
     If the fetch was incomplete/partial (see fetch_ytm_library.failures),
     we do NOT erase playlists — missing data means "couldn't determine",
     not "confirmed absent" (see architectural concern in the review).
+
+    If `only_playlists` is given (lowercase filter strings from a filtered
+    `sync`), only memberships in those playlists are updated — other
+    playlists on each entry are preserved untouched so a filtered sync never
+    pulls the rest of the library into content.toml.
     """
     # song_key(artist, title) -> set of playlist titles it currently belongs to.
     live: dict[str, set[str]] = {}
@@ -499,6 +515,8 @@ def reconcile_playlists(ytm_tracks: list[dict], local_tracks: dict[str, list[dic
             skey = song_key(t.get("artist", ""), t.get("title", ""))
             live.setdefault(skey, set()).add(pl)
 
+    filter_set = {p.lower() for p in only_playlists} if only_playlists is not None else None
+
     incomplete = bool(getattr(fetch_ytm_library, "failures", [])) or bool(getattr(fetch_ytm_library, "truncated", False))
     if incomplete:
         print("  Note: YTM fetch was incomplete — preserving existing playlists for items not seen (not erasing).")
@@ -506,6 +524,23 @@ def reconcile_playlists(ytm_tracks: list[dict], local_tracks: dict[str, list[dic
     for entries in local_tracks.values():
         for entry in entries:
             skey = song_key(entry.get("artist", ""), entry.get("name", ""))
+            if filter_set is not None:
+                # Filtered sync: only reconcile the requested playlists,
+                # preserving all other memberships as-is.
+                live_filtered = {pl for pl in live.get(skey, set())
+                                 if pl.lower() in filter_set}
+                current = set(pl_list(entry))
+                keep = {p for p in current if p.lower() not in filter_set}
+                if incomplete and skey not in live:
+                    # Couldn't determine — keep what we have instead of wiping to []
+                    continue
+                if incomplete:
+                    # Additive: keep existing plus live (don't remove on partial)
+                    current_filtered = {p for p in current if p.lower() in filter_set}
+                    entry["playlists"] = sorted(keep | current_filtered | live_filtered)
+                else:
+                    entry["playlists"] = sorted(keep | live_filtered)
+                continue
             if incomplete and skey not in live:
                 # Couldn't determine — keep what we have instead of wiping to []
                 continue
@@ -1055,7 +1090,9 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
 
     # Reconcile stored playlist membership with the live library so generated
     # .m3u8 files match what YTM actually shows (drops drifted/removed tracks).
-    reconcile_playlists(ytm_tracks, local_tracks)
+    # A filtered sync only reconciles the requested playlists so the rest of
+    # the library is never pulled into content.toml.
+    reconcile_playlists(ytm_tracks, local_tracks, only_playlists=filters)
 
     # Deduplicate by (video_id, playlist) pair — YTM sometimes returns the same track
     # multiple times within a single playlist
@@ -1171,7 +1208,8 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
         if dirty:
             write_content_toml(music_dir, local_tracks)
             print("\nGenerating playlists...")
-            write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []))
+            write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []),
+                            only_playlists=filters)
             print("\nPlaylists updated.")
         else:
             print("\nLibrary is up to date!")
@@ -1231,7 +1269,8 @@ def sync(playlist_filter: str | list[str] | None = None, config: dict | None = N
 
     write_content_toml(music_dir, local_tracks)
     print("\nGenerating playlists...")
-    write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []))
+    write_playlists(music_dir, load_content_toml(music_dir).get("tracks", []),
+                    only_playlists=filters)
 
 
 def scan_library(config: dict | None = None) -> None:
